@@ -63,6 +63,11 @@ std = [ "ark-ff/std", "ark-poly/std", "ark-relations/std", "ark-std/std", "ark-s
 print-trace = [ "ark-std/print-trace" ]
 parallel = [ "std", "ark-ff/parallel", "ark-poly/parallel", "ark-std/parallel", "ark-poly-commit/parallel", "rayon" ]
 
+[[example]]
+name = "pfr"
+path = "pfr/main.rs"
+required-features = ["std"]
+
 [[bench]]
 name = "marlin-benches"
 path = "benches/bench.rs"
