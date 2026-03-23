@@ -18,36 +18,43 @@ type PC = MarlinKZG10<Bls12_381, DensePolynomial<Fr>>;
 fn main() {
     let rng = &mut ark_std::test_rng();
 
-    // --- 1. Build the polynomials R(X) and C(X) such that R(ω^i) = ∆^{r_i} and C(ω^i) = ∆^{c_i} with r_i < c_i ---
+    // --- 1. Build the polynomials R(X) and C(X) such that R(κ^i) = ∆^{r_i} and C(κ^i) = ∆^{c_i} with r_i < c_i ---
 
-    let domain: GeneralEvaluationDomain<Fr> =
-        GeneralEvaluationDomain::new(16).expect("domain of size 16 must exist");
-    let twice_the_domain: GeneralEvaluationDomain<Fr> =
+    let w_domain: GeneralEvaluationDomain<Fr> =
+        GeneralEvaluationDomain::new(64).expect("domain of size 16 must exist");
+    let d_domain: GeneralEvaluationDomain<Fr> =
         GeneralEvaluationDomain::new(32).expect("Domain of size 32 exists");
 
     // r_evals = [∆⁰, ∆¹, ∆², ..., ∆¹⁵] the evaluations of R(X) over the domain
-    let r_evals: Vec<Fr> = twice_the_domain.elements().take(16).collect();
-    assert_eq!(r_evals.len(), 16);
-    let r_poly = EvaluationsOnDomain::from_vec_and_domain(r_evals, domain).interpolate();
+    let r_evals: Vec<Fr> = d_domain
+        .elements()
+        .take(16)
+        .chain(d_domain.elements().take(16))
+        .collect();
+    let k_domain: GeneralEvaluationDomain<Fr> =
+        GeneralEvaluationDomain::new(r_evals.len()).expect("domain of this size must exist");
+
+    assert_eq!(r_evals.len(), 32);
+    let r_poly = EvaluationsOnDomain::from_vec_and_domain(r_evals, k_domain).interpolate();
     println!("R(X) degree: {}", r_poly.degree());
 
     // c_evals = [∆¹, ∆², ∆³..., ∆¹⁶] the evaluations of C(X) over the domain
-    let c_evals: Vec<Fr> = twice_the_domain.elements().skip(1).take(16).collect();
-    assert_eq!(c_evals.len(), 16);
-    let c_poly = EvaluationsOnDomain::from_vec_and_domain(c_evals, domain).interpolate();
+    let c_evals: Vec<Fr> = d_domain.elements().skip(1).take(16).collect();
+    assert_eq!(c_evals.len(), 32);
+    let c_poly = EvaluationsOnDomain::from_vec_and_domain(c_evals, k_domain).interpolate();
     println!("C(X) degree: {}", c_poly.degree());
 
-    // domain.element(5) is the unique x in the domain with R(x) = ∆⁵
-    let w_5 = domain.element(5);
-    assert_eq!(r_poly.evaluate(&w_5), twice_the_domain.element(5));
-    // domain.element(5) is the unique x in the domain with C(x) = ∆⁶
-    assert_eq!(c_poly.evaluate(&w_5), twice_the_domain.element(6));
+    // k_domain.element(5) is the unique x in the domain with R(x) = ∆⁵
+    let w_5 = k_domain.element(5);
+    assert_eq!(r_poly.evaluate(&w_5), d_domain.element(5));
+    // k_domain.element(5) is the unique x in the domain with C(x) = ∆⁶
+    assert_eq!(c_poly.evaluate(&w_5), d_domain.element(6));
 
-    // domain.element(6) is the unique x in the domain with R(x) = ∆⁶
-    let w_6 = domain.element(6);
-    assert_eq!(r_poly.evaluate(&w_6), twice_the_domain.element(6));
+    // k_domain.element(6) is the unique x in the domain with R(x) = ∆⁶
+    let w_6 = k_domain.element(6);
+    assert_eq!(r_poly.evaluate(&w_6), d_domain.element(6));
     // domain.element(5) is the unique x in the domain with C(x) = ∆⁶
-    assert_eq!(c_poly.evaluate(&w_6), twice_the_domain.element(7));
+    assert_eq!(c_poly.evaluate(&w_6), d_domain.element(7));
 
     // --- 2. Polynomial commitment setup ---
     let max_degree = r_poly.degree().max(c_poly.degree());
@@ -63,7 +70,7 @@ fn main() {
     println!("R(X) Commitment: {:?}", commitments[0].commitment());
     println!("C(X) Commitment: {:?}", commitments[1].commitment());
 
-    // --- 4a. Open at the polys at ω⁵ ---
+    // --- 4a. Open at the polys at κ⁵ ---
     let opening_challenge = Fr::rand(rng);
     let proof = PC::open(
         &ck,
@@ -77,7 +84,7 @@ fn main() {
     .unwrap();
 
     // --- 5a. Verify ---
-    let claimed_values = [twice_the_domain.element(5), twice_the_domain.element(6)];
+    let claimed_values = [d_domain.element(5), d_domain.element(6)];
     let is_valid = PC::check(
         &vk,
         &commitments,
@@ -89,12 +96,12 @@ fn main() {
     )
     .unwrap();
 
-    println!("Evaluation at ω⁵: R(ω⁵) = {}", claimed_values[0]);
-    println!("Evaluation at ω⁵: C(ω⁵) = {}", claimed_values[1]);
+    println!("Evaluation at κ⁵: R(κ⁵) = {}", claimed_values[0]);
+    println!("Evaluation at κ⁵: C(κ⁵) = {}", claimed_values[1]);
     println!("Proof valid: {}", is_valid);
     assert!(is_valid);
 
-    // --- 4b. Open at the polys at ω⁶ ---
+    // --- 4b. Open at the polys at κ⁶ ---
     let opening_challenge = Fr::rand(rng);
     let proof = PC::open(
         &ck,
@@ -108,7 +115,7 @@ fn main() {
     .unwrap();
 
     // --- 5b. Verify ---
-    let claimed_values = [twice_the_domain.element(6), twice_the_domain.element(7)];
+    let claimed_values = [d_domain.element(6), d_domain.element(7)];
     let is_valid = PC::check(
         &vk,
         &commitments,
@@ -120,8 +127,8 @@ fn main() {
     )
     .unwrap();
 
-    println!("Evaluation at ω⁵: R(ω⁶) = {}", claimed_values[0]);
-    println!("Evaluation at ω⁵: C(ω⁵) = {}", claimed_values[1]);
+    println!("Evaluation at κ⁵: R(κ⁶) = {}", claimed_values[0]);
+    println!("Evaluation at κ⁵: C(κ⁵) = {}", claimed_values[1]);
     println!("Proof valid: {}", is_valid);
     assert!(is_valid);
 
