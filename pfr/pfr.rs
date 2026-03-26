@@ -178,18 +178,19 @@ impl PfrPublicKey {
 /// Prover state after Round 1.
 #[allow(dead_code)]
 struct Round1State {
-    /// Labeled polynomials [R, C, m, S, row̃].
+    /// Labeled polynomials [R, C, m, S, row, col, rowcol, rowtilde].
     ///
-    /// | Index | Label       | Definition              |
-    /// |-------|-------------|-------------------------|
-    /// | 0     | R           | R(κ^i) = Δ^{r_i}        |
-    /// | 1     | C           | C(κ^i) = Δ^{c_i}        |
-    /// | 2     | m           | m(ω^j) = m_j            |
-    /// | 3     | S           | S(X) = R_S·X + ρ_S·z_K  |
-    /// | 4     | row         | row̃(κ^i) = ω^{r_i}      |
-    /// | 5     | col         | row̃(κ^i) = ω^{c_i}      |
-    /// | 6     | rowcol      | row̃(κ^i) = ω^{r_i*c_i}  |
-    polynomials: [LabeledPolynomial<Fr, DensePolynomial<Fr>>; 7],
+    /// | Index | Label       | Definition                               |
+    /// |-------|-------------|------------------------------------------|
+    /// | 0     | R           | R(κ^i) = Δ^{r_i}                         |
+    /// | 1     | C           | C(κ^i) = Δ^{c_i}                         |
+    /// | 2     | m           | m(ω^j) = m_j                             |
+    /// | 3     | S           | S(X) = R_S·X + ρ_S·z_K                   |
+    /// | 4     | row         | row(κ^i) = ω^{r_i}   (statement poly)    |
+    /// | 5     | col         | col(κ^i) = ω^{c_i}   (statement poly)    |
+    /// | 6     | rowcol      | rowcol(κ^i) = ω^{r_i·c_i} (statement)   |
+    /// | 7     | rowtilde    | row̃(κ^i) = ω^{r_i} + ρ_row·z_K (blinded)|
+    polynomials: [LabeledPolynomial<Fr, DensePolynomial<Fr>>; 8],
     /// Evaluation vector: r_evals[i] = R(κ^i) = Δ^{r_i}
     r_evals: Vec<Fr>,
     /// Evaluation vector: c_evals[i] = C(κ^i) = Δ^{c_i}
@@ -309,6 +310,8 @@ pub struct PfrProof {
 /// not as part of `π_PFR`.
 #[allow(dead_code)]
 pub struct PfrPublicInputs {
+    /// [row(τ)]₁: commitment to the row-index polynomial row(X)
+    pub row_comm: Comm,
     /// [col(τ)]₁: commitment to the column-index polynomial col(X)
     pub col_comm: Comm,
     /// [rowcol(τ)]₁: commitment to the rowcol polynomial rowcol(X)
@@ -316,18 +319,43 @@ pub struct PfrPublicInputs {
 }
 
 // ---------------------------------------------------------------------------
+// Blinding helpers
+// ---------------------------------------------------------------------------
+
+/// Interpolate `evals` over `domain` and blind with ρ(X)·z(X),
+/// where ρ is a random polynomial of degree `rho_degree`.
+///
+/// - `rho_degree = 1`: used for R, C, F₁–F₅, row̃  (blinding polynomial ∈ F≤1[X])
+/// - `rho_degree = 0`: used for m  (scalar blinding)
+fn blind_over_domain<R: RngCore>(
+    evals: Vec<Fr>,
+    domain: GeneralEvaluationDomain<Fr>,
+    vanishing: &DensePolynomial<Fr>,
+    rho_degree: usize,
+    rng: &mut R,
+) -> DensePolynomial<Fr> {
+    let interp = EvaluationsOnDomain::from_vec_and_domain(evals, domain).interpolate();
+    let rho =
+        DensePolynomial::from_coefficients_vec((0..=rho_degree).map(|_| Fr::rand(rng)).collect());
+    &interp + &(&rho * vanishing)
+}
+
+// ---------------------------------------------------------------------------
 // Round 1
 // ---------------------------------------------------------------------------
 
-/// **Round 1**: build R(X), C(X), m(X), S(X), row̃(X).
+/// **Round 1**: build R(X), C(X), m(X), S(X), row(X), col(X), rowcol(X), row̃(X).
 ///
-/// | Paper variable | Code variable   | Definition                                    |
-/// |----------------|-----------------|-----------------------------------------------|
-/// | R(X)           | `r_poly`        | R(κ^i) = Δ^{r_i}; blinded by ρ_R(X)·z_K(X)  |
-/// | C(X)           | `c_poly`        | C(κ^i) = Δ^{c_i}; blinded by ρ_C(X)·z_K(X)  |
-/// | m(X)           | `m_poly`        | m(ω^j) = m_j (multiplicity)                  |
-/// | S(X)=0         | `s_poly`        | blinding; zero in no-ZK                       |
-/// | row̃(X)         | `rowtilde_poly` | row̃(κ^i) = ω^{r_i}                           |
+/// | Paper variable | Code variable   | Definition                                           |
+/// |----------------|-----------------|------------------------------------------------------|
+/// | R(X)           | `r_poly`        | R(κ^i) = Δ^{r_i}; blinded by ρ_R(X)·z_K(X)           |
+/// | C(X)           | `c_poly`        | C(κ^i) = Δ^{c_i}; blinded by ρ_C(X)·z_K(X)           |
+/// | m(X)           | `m_poly`        | m(ω^j) = m_j; blinded by ρ_m·z_H(X)                  |
+/// | S(X)           | `s_poly`        | S(X) = R_S·X + ρ_S·z_K(X); R_S, ρ_S ← F              |
+/// | row(X)         | `row_poly`      | row(κ^i) = ω^{r_i}; statement polynomial (unblinded) |
+/// | col(X)         | `col_poly`      | col(κ^i) = ω^{c_i}; statement polynomial (unblinded) |
+/// | rowcol(X)      | `rowcol_poly`   | rowcol(κ^i) = ω^{r_i·c_i}; statement (unblinded)     |
+/// | row̃(X)         | `rowtilde_poly` | row̃ = row + ρ_row(X)·z_K(X); ρ_row ← F≤1[X]          |
 fn round_one<R: RngCore>(
     pk: &PfrPublicKey,
     row_indices: &[usize],
@@ -335,49 +363,42 @@ fn round_one<R: RngCore>(
     rng: &mut R,
 ) -> Round1State {
     let z_k: DensePolynomial<Fr> = pk.k_domain.vanishing_polynomial().into();
+    let z_h: DensePolynomial<Fr> = pk.h_domain.vanishing_polynomial().into();
 
     // R(X): R(κ^i) = Δ^{r_i}, blinded by ρ_R(X)·z_K(X) with ρ_R ← F≤1[X]
     let r_evals: Vec<Fr> = row_indices
         .iter()
         .map(|&j| pk.d_domain.element(j))
         .collect();
-    let r_interp =
-        EvaluationsOnDomain::from_vec_and_domain(r_evals.clone(), pk.k_domain).interpolate();
-    let rho_r = DensePolynomial::from_coefficients_vec(vec![Fr::rand(rng), Fr::rand(rng)]);
-    let r_poly = &r_interp + &(&rho_r * &z_k);
+    let r_poly = blind_over_domain(r_evals.clone(), pk.k_domain, &z_k, 1, rng);
 
     // C(X): C(κ^i) = Δ^{c_i}, blinded by ρ_C(X)·z_K(X) with ρ_C ← F≤1[X]
     let c_evals: Vec<Fr> = col_indices
         .iter()
         .map(|&j| pk.d_domain.element(j))
         .collect();
-    let c_interp =
-        EvaluationsOnDomain::from_vec_and_domain(c_evals.clone(), pk.k_domain).interpolate();
-    let rho_c = DensePolynomial::from_coefficients_vec(vec![Fr::rand(rng), Fr::rand(rng)]);
-    let c_poly = &c_interp + &(&rho_c * &z_k);
+    let c_poly = blind_over_domain(c_evals.clone(), pk.k_domain, &z_k, 1, rng);
 
     // m(X): m(ω^j) = m_j, blinded by ρ_m·z_H(X) with ρ_m ← F
     let mults = pk.compute_multiplicities(row_indices, col_indices);
     let m_evals: Vec<Fr> = mults.iter().map(|&v| Fr::from(v)).collect();
-    let m_interp =
-        EvaluationsOnDomain::from_vec_and_domain(m_evals.clone(), pk.h_domain).interpolate();
-    let rho_m = Fr::rand(rng);
-    let z_h: DensePolynomial<Fr> = pk.h_domain.vanishing_polynomial().into();
-    let m_poly = &m_interp + &(&z_h * rho_m);
+    let m_poly = blind_over_domain(m_evals.clone(), pk.h_domain, &z_h, 0, rng);
 
     // S(X) = R_S·X + ρ_S·z_K(X),  R_S, ρ_S ← F
     let r_s = Fr::rand(rng);
     let rho_s = Fr::rand(rng);
-    let s_poly = &DensePolynomial::from_coefficients_vec(vec![Fr::zero(), r_s])
-        + &(&z_k * rho_s);
+    let s_poly = &DensePolynomial::from_coefficients_vec(vec![Fr::zero(), r_s]) + &(&z_k * rho_s);
 
-    // row(X): row(κ^i) = = ω^{r_i}  (note: ω-powers, not Δ-powers)
+    // row(X): row(κ^i) = ω^{r_i}  (note: ω-powers, not Δ-powers) — statement polynomial
     let row_evals: Vec<Fr> = row_indices
         .iter()
         .map(|&j| pk.h_domain.element(j))
         .collect();
     let row_poly =
         EvaluationsOnDomain::from_vec_and_domain(row_evals.clone(), pk.k_domain).interpolate();
+
+    // row̃(X) = row(X) + ρ_row(X)·z_K(X),  ρ_row ← F≤1[X]
+    let rowtilde_poly = blind_over_domain(row_evals.clone(), pk.k_domain, &z_k, 1, rng);
 
     // col(X): col(κ^i) = = ω^{c_i}  (note: ω-powers, not Δ-powers)
     let col_evals: Vec<Fr> = col_indices
@@ -405,6 +426,7 @@ fn round_one<R: RngCore>(
             LabeledPolynomial::new("row".into(), row_poly, None, None),
             LabeledPolynomial::new("col".into(), col_poly, None, None),
             LabeledPolynomial::new("rowcol".into(), rowcol_poly, None, None),
+            LabeledPolynomial::new("rowtilde".into(), rowtilde_poly, None, None),
         ],
         r_evals,
         c_evals,
@@ -432,13 +454,18 @@ fn round_one<R: RngCore>(
 /// | F₄(κ^i)        | `f4_evals`    | 1 / (β + C(κ^i)/Δ^t)                |
 /// | F₅(κ^i)        | `f5_evals`    | −m(κ^i)·z_{K∖H}(κ^i) / (β + h(κ^i)) |
 /// | Δ              | `big_delta`   | `d_domain.element(1)`               |
-/// | z_{K∖H}        | `zkh_at_ki`   | = 1 when K = H (our toy example)    |
-fn round_two<R: RngCore>(pk: &PfrPublicKey, round1: &Round1State, beta: Fr, rng: &mut R) -> Round2State {
+/// | z_{K∖H}        | `zkh_at_ki`   | z_{K∖H}(κ^i)                        |
+fn round_two<R: RngCore>(
+    pk: &PfrPublicKey,
+    round1: &Round1State,
+    beta: Fr,
+    rng: &mut R,
+) -> Round2State {
     // Δ = generator of D
     let big_delta: Fr = pk.big_delta();
     let big_delta_t: Fr = big_delta.pow([pk.t as u64]);
 
-    // Reuse evaluation vectors stored in Round1State — no re-evaluation needed.
+    // Reuse evaluation vectors stored in Round1State.
     // r_at_ki[i] = R(κ^i) = Δ^{r_i},  c_at_ki[i] = C(κ^i) = Δ^{c_i}
     let r_at_ki = &round1.r_evals;
     let c_at_ki = &round1.c_evals;
@@ -532,16 +559,11 @@ fn round_two<R: RngCore>(pk: &PfrPublicKey, round1: &Round1State, beta: Fr, rng:
 
     // Interpolate each F_j over K, then blind with ρ_j(X)·z_K(X), ρ_j ← F≤1[X]
     let z_k: DensePolynomial<Fr> = pk.k_domain.vanishing_polynomial().into();
-    let mut blind = |evals: Vec<Fr>| -> DensePolynomial<Fr> {
-        let interp = EvaluationsOnDomain::from_vec_and_domain(evals, pk.k_domain).interpolate();
-        let rho = DensePolynomial::from_coefficients_vec(vec![Fr::rand(rng), Fr::rand(rng)]);
-        &interp + &(&rho * &z_k)
-    };
-    let f1_poly = blind(f1_evals.clone());
-    let f2_poly = blind(f2_evals.clone());
-    let f3_poly = blind(f3_evals.clone());
-    let f4_poly = blind(f4_evals.clone());
-    let f5_poly = blind(f5_evals.clone());
+    let f1_poly = blind_over_domain(f1_evals.clone(), pk.k_domain, &z_k, 1, rng);
+    let f2_poly = blind_over_domain(f2_evals.clone(), pk.k_domain, &z_k, 1, rng);
+    let f3_poly = blind_over_domain(f3_evals.clone(), pk.k_domain, &z_k, 1, rng);
+    let f4_poly = blind_over_domain(f4_evals.clone(), pk.k_domain, &z_k, 1, rng);
+    let f5_poly = blind_over_domain(f5_evals.clone(), pk.k_domain, &z_k, 1, rng);
 
     Round2State {
         polynomials: [
@@ -606,14 +628,15 @@ fn round_three(
         DensePolynomial::from_coefficients_vec(coeffs)
     };
 
-    // Round-1 polynomials: [R, C, m, S, row, col, rowcol].
+    // Round-1 polynomials: [R, C, m, S, row, col, rowcol, rowtilde].
     let r_poly = round1_state.polynomials[0].polynomial();
     let c_poly = round1_state.polynomials[1].polynomial();
     let m_poly = round1_state.polynomials[2].polynomial();
-    let row_poly = round1_state.polynomials[4].polynomial(); // row̃ = row (no ZK)
+    let row_poly = round1_state.polynomials[4].polynomial(); // public row(X)
     let col_poly = round1_state.polynomials[5].polynomial();
     let rowcol_poly = round1_state.polynomials[6].polynomial();
-    // Round-2 polynomials: [F1, F2, F3, F4, F5].
+    let rowtilde_poly = round1_state.polynomials[7].polynomial(); // blinded row̃(X)
+                                                                  // Round-2 polynomials: [F1, F2, F3, F4, F5].
     let f1_poly = round2_state.polynomials[0].polynomial();
     let f2_poly = round2_state.polynomials[1].polynomial();
     let f3_poly = round2_state.polynomials[2].polynomial();
@@ -708,14 +731,15 @@ fn round_three(
     let term = &(c_poly * c_poly) - col_poly;
     big_sum += &scale(eta_pow, &term);
 
-    // η⁷: rowcol − row̃·col  (row̃ = row in no-ZK mode)
+    // η⁷: rowcol − row̃·col
     eta_pow *= eta;
-    let term = rowcol_poly - &(row_poly * col_poly);
+    let term = rowcol_poly - &(rowtilde_poly * col_poly);
     big_sum += &scale(eta_pow, &term);
 
-    // η⁸: row̃ − row = 0  (no ZK)
+    // η⁸: row̃(X) − row(X)  (vanishes on K since row̃ = row + ρ_row·z_K)
     eta_pow *= eta;
-    // big_sum += 0
+    let term = rowtilde_poly - row_poly;
+    big_sum += &scale(eta_pow, &term);
 
     // η⁹: ∑Fⱼ + η·S(X)  (combined per eq. 10; R* already encodes the η·R_S contribution)
     eta_pow *= eta;
@@ -759,14 +783,14 @@ fn round_three(
 
 /// **Round 4**: evaluate h, R, C, row at the verifier challenge α.
 ///
-/// In no-ZK mode row̃(X) = row(X), so we evaluate `round1_state.polynomials[4]`.
+/// Evaluates row̃(X) (index 7) at α, which equals row(α) when ρ_row = 0.
 fn round_four(pk: &PfrPublicKey, round1_state: &Round1State, alpha: Fr) -> Round4State {
     Round4State {
         alpha,
         h_alpha: pk.h_poly.evaluate(&alpha),
         r_alpha: round1_state.polynomials[0].polynomial().evaluate(&alpha),
         c_alpha: round1_state.polynomials[1].polynomial().evaluate(&alpha),
-        row_alpha: round1_state.polynomials[4].polynomial().evaluate(&alpha),
+        row_alpha: round1_state.polynomials[7].polynomial().evaluate(&alpha),
     }
 }
 
@@ -816,10 +840,11 @@ fn round_five(
     let r_poly = round1_state.polynomials[0].polynomial();
     let c_poly = round1_state.polynomials[1].polynomial();
     let m_poly = round1_state.polynomials[2].polynomial();
-    let row_poly = round1_state.polynomials[4].polynomial();
+    let row_poly = round1_state.polynomials[4].polynomial(); // public row(X)
     let col_poly = round1_state.polynomials[5].polynomial();
     let rowcol_poly = round1_state.polynomials[6].polynomial();
-    // Round-2 polynomials
+    let rowtilde_poly = round1_state.polynomials[7].polynomial(); // blinded row̃(X)
+                                                                  // Round-2 polynomials
     let f1_poly = round2_state.polynomials[0].polynomial();
     let f2_poly = round2_state.polynomials[1].polynomial();
     let f3_poly = round2_state.polynomials[2].polynomial();
@@ -903,7 +928,9 @@ fn round_five(
     eta_pow *= eta;
     big_lin += &scale(eta_pow, &(rowcol_poly - &scale(row_alpha, col_poly)));
 
-    // η⁸: row̃(X) − row(X) = 0 in no-ZK mode; omit (activated in Step 6)
+    // η⁸: row̃(X) − row(X)
+    eta_pow *= eta;
+    big_lin += &scale(eta_pow, &(rowtilde_poly - row_poly));
 
     // η⁹: ∑Fⱼ(X) + η·S(X)  — matches round_three exactly
     let s_poly = round1_state.polynomials[3].polynomial();
@@ -929,7 +956,7 @@ fn round_five(
     numerator += &scale(delta_pow, &(c_poly - &const_poly(c_alpha)));
 
     delta_pow *= delta;
-    numerator += &scale(delta_pow, &(row_poly - &const_poly(row_alpha)));
+    numerator += &scale(delta_pow, &(rowtilde_poly - &const_poly(row_alpha)));
 
     delta_pow *= delta;
     numerator += &scale(delta_pow, &lin_poly);
@@ -997,13 +1024,14 @@ pub fn prove<R: RngCore>(
     round1_state.rands = round1_rands;
 
     let mut round1_comms = round1_comms;
-    let r_comm = round1_comms.remove(0);
-    let c_comm = round1_comms.remove(0);
-    let m_comm = round1_comms.remove(0);
-    let s_comm = round1_comms.remove(0);
-    let rowtilde_comm = round1_comms.remove(0);
-    let col_comm = round1_comms.remove(0);
-    let rowcol_comm = round1_comms.remove(0);
+    let r_comm = round1_comms.remove(0); // [R(τ)]₁
+    let c_comm = round1_comms.remove(0); // [C(τ)]₁
+    let m_comm = round1_comms.remove(0); // [m(τ)]₁
+    let s_comm = round1_comms.remove(0); // [S(τ)]₁
+    let row_comm = round1_comms.remove(0); // [row(τ)]₁  — statement polynomial
+    let col_comm = round1_comms.remove(0); // [col(τ)]₁  — statement polynomial
+    let rowcol_comm = round1_comms.remove(0); // [rowcol(τ)]₁ — statement polynomial
+    let rowtilde_comm = round1_comms.remove(0); // [row̃(τ)]₁  — blinded, in proof
 
     // Derive β by absorbing Round 1 commitments into the transcript.
     fs_rng.absorb(
@@ -1104,6 +1132,7 @@ pub fn prove<R: RngCore>(
         q_poly_comm,
     };
     let public_inputs = PfrPublicInputs {
+        row_comm,
         col_comm,
         rowcol_comm,
     };
@@ -1124,20 +1153,36 @@ pub fn prove<R: RngCore>(
 ///                + δ³([row̃(τ)]₁ − row̃_α·[1]₁)
 ///                + δ⁴[Lin(τ)]₁
 ///
-///   where [Lin(τ)]₁ is derived from the proof commitments and the public input
-///   commitments `col_comm` and `rowcol_comm`.
+///   where [Lin(τ)]₁ = U(α)·[big_lin(τ)]₁ − η⁹·α·[R*(τ)]₁ − U(α)·z_K(α)·[q(τ)]₁
+///
+///   and [big_lin(τ)]₁ is computed as an MSM over proof and public-input commitments:
+///     η⁰·(β+R_α)·[F₁(τ)]₁ − η⁰·[1]₁
+///   + η¹·(β+C_α)·[F₂(τ)]₁ − η¹·[1]₁
+///   + η²·(β·Δ·R_α+C_α)·[F₃(τ)]₁ − η²·Δ·R_α·[1]₁
+///   + η³·(β·Δᵗ+C_α)·[F₄(τ)]₁ − η³·Δᵗ·[1]₁
+///   + η⁴·(β+h_α)·[F₅(τ)]₁ + η⁴·z_{K∖H}(α)·[m(τ)]₁
+///   + η⁵·R_α²·[1]₁ − η⁵·[row(τ)]₁
+///   + η⁶·C_α²·[1]₁ − η⁶·[col(τ)]₁
+///   + η⁷·[rowcol(τ)]₁ − η⁷·row̃_α·[col(τ)]₁
+///   + η⁸·[row̃(τ)]₁ − η⁸·[row(τ)]₁
+///   + η⁹·(∑ⱼ[Fⱼ(τ)]₁ + η·[S(τ)]₁)
 ///
 ///   Check: e([y]₁, [1]₂) = e([Q(τ)]₁, [τ − α]₂)
 ///
-/// `col_comm` and `rowcol_comm` are public inputs (committed before the proof),
-/// not part of `π_PFR`.
-pub fn verify(pk: &PfrPublicKey, proof: &PfrProof, col_comm: &Comm, rowcol_comm: &Comm) -> bool {
+/// `col_comm` and `rowcol_comm` are public inputs.
+pub fn verify(
+    pk: &PfrPublicKey,
+    proof: &PfrProof,
+    row_comm: &Comm,
+    col_comm: &Comm,
+    rowcol_comm: &Comm,
+) -> bool {
     use ark_bls12_381::Bls12_381;
     use ark_bls12_381::G1Affine;
     use ark_ec::{msm::VariableBaseMSM, AffineCurve, PairingEngine, ProjectiveCurve};
     use ark_ff::PrimeField;
 
-    // Re-derive Fiat-Shamir challenges deterministically from the proof.
+    // Derive Fiat-Shamir challenges
     let mut fs_rng = FS::initialize(&to_bytes![pk.h_commitment.commitment()].unwrap());
 
     fs_rng.absorb(
@@ -1244,9 +1289,9 @@ pub fn verify(pk: &PfrPublicKey, proof: &PfrProof, col_comm: &Comm, rowcol_comm:
     add_comm!(eta_pow * zkh_at_alpha, &proof.m_comm);
 
     eta_pow *= eta; // η⁵
-                    // η⁵: R_α² − row̃(τ)  (row̃ = row in no-ZK)
+                    // η⁵: R_α² − row(τ)  (public statement polynomial)
     add_g1!(eta_pow * r_alpha * r_alpha);
-    add_comm!(-eta_pow, &proof.rowtilde_comm);
+    add_comm!(-eta_pow, row_comm);
 
     eta_pow *= eta; // η⁶
                     // η⁶: C_α² − col(τ)
@@ -1258,7 +1303,9 @@ pub fn verify(pk: &PfrPublicKey, proof: &PfrProof, col_comm: &Comm, rowcol_comm:
     add_comm!(eta_pow, rowcol_comm);
     add_comm!(-(eta_pow * row_alpha), col_comm);
 
-    eta_pow *= eta; // η⁸: row̃(τ) − row(τ) = 0 in no-ZK; omit
+    eta_pow *= eta; // η⁸: row̃(τ) − row(τ)
+    add_comm!(eta_pow, &proof.rowtilde_comm);
+    add_comm!(-eta_pow, row_comm);
 
     eta_pow *= eta; // η⁹ = eta9
                     // η⁹: ∑Fⱼ(τ) + η·S(τ)
@@ -1407,22 +1454,45 @@ mod tests {
         let pk = setup();
         let s = round_one(&pk, &ROW, &COL, &mut ark_std::test_rng());
         let poly = s.polynomials[3].polynomial();
-        assert!(poly.degree() <= M + 1, "deg S = {} > m+1 = {}", poly.degree(), M + 1);
+        assert!(
+            poly.degree() <= M + 1,
+            "deg S = {} > m+1 = {}",
+            poly.degree(),
+            M + 1
+        );
         // S(κ^i) = R_S·κ^i + ρ_S·z_K(κ^i) = R_S·κ^i  (z_K vanishes on K)
         // so S does NOT vanish on K in general; just check degree bound
     }
 
-    /// row̃(κ^i) = ω^{r_i} for all i
+    /// row̃(κ^i) = ω^{r_i} for all i  (index 7)
     #[test]
     fn round1_rowtilde_poly() {
         let pk = setup();
         let s = round_one(&pk, &ROW, &COL, &mut ark_std::test_rng());
-        let poly = s.polynomials[4].polynomial();
+        let poly = s.polynomials[7].polynomial();
         for (i, &r) in ROW.iter().enumerate() {
             assert_eq!(
                 poly.evaluate(&pk.k_domain.element(i)),
                 pk.h_domain.element(r),
                 "row̃(κ^{i}) ≠ ω^{r}"
+            );
+        }
+    }
+
+    /// (row̃ − row)(X) vanishes on K for any blinding randomness
+    #[test]
+    fn round1_rowtilde_minus_row_vanishes_on_k() {
+        let pk = setup();
+        // Use a fresh rng so blinding scalars are random (currently zero, but test is general)
+        let s = round_one(&pk, &ROW, &COL, &mut ark_std::test_rng());
+        let row_poly = s.polynomials[4].polynomial();
+        let rowtilde_poly = s.polynomials[7].polynomial();
+        let diff = rowtilde_poly - row_poly;
+        for i in 0..M {
+            assert_eq!(
+                diff.evaluate(&pk.k_domain.element(i)),
+                Fr::zero(),
+                "(row̃ − row)(κ^{i}) ≠ 0"
             );
         }
     }
@@ -1678,7 +1748,13 @@ mod tests {
         let pk = PfrPublicKey::setup(n, m, t, rng);
         let (proof, public_inputs) = prove(&pk, row, col, rng);
         assert!(
-            verify(&pk, &proof, &public_inputs.col_comm, &public_inputs.rowcol_comm),
+            verify(
+                &pk,
+                &proof,
+                &public_inputs.row_comm,
+                &public_inputs.col_comm,
+                &public_inputs.rowcol_comm
+            ),
             "verification failed for n={n}, m={m}, t={t}, row={row:?}, col={col:?}",
         );
     }
