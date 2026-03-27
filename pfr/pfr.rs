@@ -177,7 +177,7 @@ impl PfrPublicKey {
 
 /// Prover state after Round 1.
 #[allow(dead_code)]
-struct Round1State {
+pub(crate) struct Round1State {
     /// Labeled polynomials [R, C, m, S, row, col, rowcol, rowtilde].
     ///
     /// | Index | Label       | Definition                               |
@@ -190,7 +190,7 @@ struct Round1State {
     /// | 5     | col         | col(κ^i) = ω^{c_i}   (statement poly)    |
     /// | 6     | rowcol      | rowcol(κ^i) = ω^{r_i·c_i} (statement)   |
     /// | 7     | rowtilde    | row̃(κ^i) = ω^{r_i} + ρ_row·z_K (blinded)|
-    polynomials: [LabeledPolynomial<Fr, DensePolynomial<Fr>>; 8],
+    pub(crate) polynomials: [LabeledPolynomial<Fr, DensePolynomial<Fr>>; 8],
     /// Evaluation vector: r_evals[i] = R(κ^i) = Δ^{r_i}
     r_evals: Vec<Fr>,
     /// Evaluation vector: c_evals[i] = C(κ^i) = Δ^{c_i}
@@ -207,9 +207,9 @@ struct Round1State {
 
 /// Prover state after Round 2.
 #[allow(dead_code)]
-struct Round2State {
+pub(crate) struct Round2State {
     /// Labeled polynomials [F₁, …, F₅]; polynomials accessible via `.polynomial()`.
-    polynomials: [LabeledPolynomial<Fr, DensePolynomial<Fr>>; 5],
+    pub(crate) polynomials: [LabeledPolynomial<Fr, DensePolynomial<Fr>>; 5],
     f_evals: [Vec<Fr>; 5],
     /// β: verifier challenge that triggered Round 2.
     beta: Fr,
@@ -219,14 +219,14 @@ struct Round2State {
 
 /// Prover state after Round 3.
 #[allow(dead_code)]
-struct Round3State {
+pub(crate) struct Round3State {
     /// Labeled polynomials [R*, q]; accessible via `.polynomial()`.
     ///
     /// | Index | Label  | Definition                      |
     /// |-------|--------|---------------------------------|
     /// | 0     | r_star | R*(X) = R_F(X) · U(X)           |
     /// | 1     | q      | q(X) = P(X) / (z_K(X) · U(X))  |
-    polynomials: Vec<LabeledPolynomial<Fr, DensePolynomial<Fr>>>,
+    pub(crate) polynomials: Vec<LabeledPolynomial<Fr, DensePolynomial<Fr>>>,
     /// U(X) = X³ − 1, stored to avoid recomputing in round_five.
     u_poly: DensePolynomial<Fr>,
     /// η: verifier challenge that triggered Round 3.
@@ -239,7 +239,7 @@ struct Round3State {
 
 /// Prover state after Round 4.
 #[allow(dead_code)]
-struct Round4State {
+pub(crate) struct Round4State {
     /// α: verifier challenge that triggered Round 4.
     alpha: Fr,
     /// h(α)
@@ -356,7 +356,7 @@ fn blind_over_domain<R: RngCore>(
 /// | col(X)         | `col_poly`      | col(κ^i) = ω^{c_i}; statement polynomial (unblinded) |
 /// | rowcol(X)      | `rowcol_poly`   | rowcol(κ^i) = ω^{r_i·c_i}; statement (unblinded)     |
 /// | row̃(X)         | `rowtilde_poly` | row̃ = row + ρ_row(X)·z_K(X); ρ_row ← F≤1[X]          |
-fn round_one<R: RngCore>(
+pub(crate) fn round_one<R: RngCore>(
     pk: &PfrPublicKey,
     row_indices: &[usize],
     col_indices: &[usize],
@@ -455,7 +455,7 @@ fn round_one<R: RngCore>(
 /// | F₅(κ^i)        | `f5_evals`    | −m(κ^i)·z_{K∖H}(κ^i) / (β + h(κ^i)) |
 /// | Δ              | `big_delta`   | `d_domain.element(1)`               |
 /// | z_{K∖H}        | `zkh_at_ki`   | z_{K∖H}(κ^i)                        |
-fn round_two<R: RngCore>(
+pub(crate) fn round_two<R: RngCore>(
     pk: &PfrPublicKey,
     round1: &Round1State,
     beta: Fr,
@@ -517,44 +517,44 @@ fn round_two<R: RngCore>(
         })
         .collect();
 
-    // F₁(κ^i) = 1 / (β + R(κ^i))
-    let f1_evals: Vec<Fr> = r_at_ki
-        .iter()
-        .map(|&r| (beta + r).inverse().unwrap())
-        .collect();
+    // Batch-invert all denominators using Montgomery's trick.
+    // Two passes:
+    //   Pass 1: invert Δ·R(κ^i) to get (Δ·R)⁻¹ — needed to form F3 denoms.
+    //   Pass 2: invert the 5 F-denom blocks simultaneously.
+    //
+    // Block layout for pass 2 (each block has m entries):
+    //   block 0: β + C(κ^i)/(Δ·R(κ^i))  — F3 denom
+    //   block 1: β + R(κ^i)              — F1 denom
+    //   block 2: β + C(κ^i)/Δᵗ          — F4 denom
+    //   block 3: β + C(κ^i)              — F2 denom
+    //   block 4: β + h(κ^i)              — F5 denom
 
-    // F₂(κ^i) = 1 / (β + C(κ^i))
-    let f2_evals: Vec<Fr> = c_at_ki
-        .iter()
-        .map(|&c| (beta + c).inverse().unwrap())
-        .collect();
-
-    // F₃(κ^i) = 1 / (β + C(κ^i) / (Δ · R(κ^i)))
-    let f3_evals: Vec<Fr> = r_at_ki
-        .iter()
-        .zip(c_at_ki.iter())
-        .map(|(&r, &c)| {
-            let c_over_delta_r = c * (big_delta * r).inverse().unwrap();
-            (beta + c_over_delta_r).inverse().unwrap()
-        })
-        .collect();
-
-    // F₄(κ^i) = 1 / (β + C(κ^i) / Δ^t)
+    // Δᵗ is a single scalar — one inversion outside the batch.
     let delta_t_inv = big_delta_t.inverse().unwrap();
-    let f4_evals: Vec<Fr> = c_at_ki
-        .iter()
-        .map(|&c| (beta + c * delta_t_inv).inverse().unwrap())
-        .collect();
 
-    // F₅(κ^i) = −m(κ^i) · z_{K∖H}(κ^i) / (β + h(κ^i))
+    // Pass 1: batch-invert Δ·R(κ^i)
+    let mut delta_r: Vec<Fr> = r_at_ki.iter().map(|&r| big_delta * r).collect();
+    ark_ff::batch_inversion(&mut delta_r);
+
+    // Pass 2: fill 5m denominators and batch-invert
+    let mut denoms: Vec<Fr> = Vec::with_capacity(5 * pk.m);
+    for i in 0..pk.m { denoms.push(beta + c_at_ki[i] * delta_r[i]); } // block 0: F3
+    for i in 0..pk.m { denoms.push(beta + r_at_ki[i]); }               // block 1: F1
+    for i in 0..pk.m { denoms.push(beta + c_at_ki[i] * delta_t_inv); } // block 2: F4
+    for i in 0..pk.m { denoms.push(beta + c_at_ki[i]); }               // block 3: F2
+    for i in 0..pk.m { denoms.push(beta + h_at_ki[i]); }               // block 4: F5
+    ark_ff::batch_inversion(&mut denoms);
+
+    let f3_evals: Vec<Fr> = denoms[0..pk.m].to_vec();
+    let f1_evals: Vec<Fr> = denoms[pk.m..2 * pk.m].to_vec();
+    let f4_evals: Vec<Fr> = denoms[2 * pk.m..3 * pk.m].to_vec();
+    let f2_evals: Vec<Fr> = denoms[3 * pk.m..4 * pk.m].to_vec();
+    // F₅(κ^i) = −m(κ^i) · z_{K∖H}(κ^i) · (β + h(κ^i))⁻¹
     let f5_evals: Vec<Fr> = m_at_ki
         .iter()
-        .zip(h_at_ki.iter())
         .zip(zkh_at_ki.iter())
-        .map(|((&m_val, &h_val), &zkh)| {
-            let denom_inv = (beta + h_val).inverse().unwrap();
-            -m_val * zkh * denom_inv
-        })
+        .zip(denoms[4 * pk.m..5 * pk.m].iter())
+        .map(|((&m_val, &zkh), &h_inv)| -m_val * zkh * h_inv)
         .collect();
 
     // Interpolate each F_j over K, then blind with ρ_j(X)·z_K(X), ρ_j ← F≤1[X]
@@ -602,7 +602,7 @@ fn round_two<R: RngCore>(
 /// − η⁹ · X · R*(X)
 ///
 /// and q(X) = P(X) / (z_K(X) · U(X)).
-fn round_three(
+pub(crate) fn round_three(
     pk: &PfrPublicKey,
     round1_state: &Round1State,
     round2_state: &Round2State,
@@ -784,7 +784,7 @@ fn round_three(
 /// **Round 4**: evaluate h, R, C, row at the verifier challenge α.
 ///
 /// Evaluates row̃(X) (index 7) at α, which equals row(α) when ρ_row = 0.
-fn round_four(pk: &PfrPublicKey, round1_state: &Round1State, alpha: Fr) -> Round4State {
+pub(crate) fn round_four(pk: &PfrPublicKey, round1_state: &Round1State, alpha: Fr) -> Round4State {
     Round4State {
         alpha,
         h_alpha: pk.h_poly.evaluate(&alpha),
@@ -816,7 +816,7 @@ fn round_four(pk: &PfrPublicKey, round1_state: &Round1State, alpha: Fr) -> Round
 ///
 /// Q(X) = [ (h(X)−h_α) + δ(R(X)−R_α) + δ²(C(X)−C_α)
 ///          + δ³(row̃(X)−row̃_α) + δ⁴·Lin(X) ] / (X − α)
-fn round_five(
+pub(crate) fn round_five(
     pk: &PfrPublicKey,
     round1_state: &Round1State,
     round2_state: &Round2State,
