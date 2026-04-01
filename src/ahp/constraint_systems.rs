@@ -126,7 +126,7 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
     joint_matrix: &Vec<Vec<usize>>,
     a: &Matrix<F>,
     b: &Matrix<F>,
-    c: &Matrix<F>,
+    _c: &Matrix<F>,
     interpolation_domain: GeneralEvaluationDomain<F>,
     output_domain: GeneralEvaluationDomain<F>,
     input_domain: GeneralEvaluationDomain<F>,
@@ -152,7 +152,7 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
         .flatten()
         .collect::<BTreeMap<(usize, usize), F>>();
 
-    let c = c
+    let c = _c
         .iter()
         .enumerate()
         .map(|(r, row)| row.iter().map(move |(f, i)| ((r, *i), *f)))

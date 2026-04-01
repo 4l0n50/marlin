@@ -15,8 +15,17 @@ pub struct VerifierState<F: PrimeField> {
 
     pub(crate) first_round_msg: Option<VerifierFirstMsg<F>>,
     pub(crate) second_round_msg: Option<VerifierSecondMsg<F>>,
+    pub(crate) third_round_msg: Option<VerifierThirdMsg<F>>,
 
-    pub(crate) gamma: Option<F>,
+    /// gamma_claim: the inner sum γ = Φ(α,β) sent by the prover in round 3
+    pub(crate) gamma_claim: Option<F>,
+}
+
+/// Third verifier message.
+#[derive(Copy, Clone)]
+pub struct VerifierThirdMsg<F> {
+    /// Query point for the inner sumcheck polynomials.
+    pub zeta: F,
 }
 
 /// First message of the verifier.
@@ -72,7 +81,8 @@ impl<F: PrimeField> AHPForR1CS<F> {
             domain_k,
             first_round_msg: Some(msg),
             second_round_msg: None,
-            gamma: None,
+            third_round_msg: None,
+            gamma_claim: None,
         };
 
         Ok((msg, new_state))
@@ -91,12 +101,17 @@ impl<F: PrimeField> AHPForR1CS<F> {
     }
 
     /// Output the third message and next round state.
+    /// Absorbs the prover's gamma_claim (γ = Φ(α,β)) and samples zeta.
     pub fn verifier_third_round<R: RngCore>(
         mut state: VerifierState<F>,
+        gamma_claim: F,
         rng: &mut R,
-    ) -> VerifierState<F> {
-        state.gamma = Some(F::rand(rng));
-        state
+    ) -> (VerifierThirdMsg<F>, VerifierState<F>) {
+        state.gamma_claim = Some(gamma_claim);
+        let zeta = state.domain_k.sample_element_outside_domain(rng);
+        let msg = VerifierThirdMsg { zeta };
+        state.third_round_msg = Some(msg);
+        (msg, state)
     }
 
     /// Output the query state and next round state.
@@ -106,7 +121,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
     ) -> (QuerySet<F>, VerifierState<F>) {
         let beta = state.second_round_msg.unwrap().beta;
 
-        let gamma = state.gamma.unwrap();
+        let zeta = state.third_round_msg.unwrap().zeta;
 
         let mut query_set = QuerySet::new();
         // For the first linear combination
@@ -181,9 +196,10 @@ impl<F: PrimeField> AHPForR1CS<F> {
         // // This LC is the only one that is evaluated:
         // let inner_sumcheck = a_poly_lc - (b_lc * (gamma * &g_2_at_gamma + &(t_at_beta / &k_size))) - h_lc
         // main_lc.set_label("inner_sumcheck");
-        query_set.insert(("g_2".into(), ("gamma".into(), gamma)));
-        query_set.insert(("s_2".into(), ("gamma".into(), gamma)));
-        query_set.insert(("inner_sumcheck".into(), ("gamma".into(), gamma)));
+        query_set.insert(("f".into(), ("zeta".into(), zeta)));
+        query_set.insert(("g_2".into(), ("zeta".into(), zeta)));
+        query_set.insert(("s_2".into(), ("zeta".into(), zeta)));
+        query_set.insert(("inner_sumcheck".into(), ("zeta".into(), zeta)));
 
         (query_set, state)
     }

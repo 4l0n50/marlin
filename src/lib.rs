@@ -205,8 +205,8 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
         // --------------------------------------------------------------------
 
         // --------------------------------------------------------------------
-        // Third round
-        let (prover_third_msg, prover_third_oracles) =
+        // Third round: prover sends f(X) and γ = t(β)
+        let (prover_third_msg, prover_third_oracles, prover_state) =
             AHPForR1CS::prover_third_round(&verifier_second_msg, prover_state, zk_rng)?;
 
         let third_round_comm_time = start_timer!(|| "Committing to third round polys");
@@ -218,9 +218,32 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
         .map_err(Error::from_pc_err)?;
         end_timer!(third_round_comm_time);
 
+        // Extract γ from the prover message to pass to the verifier
+        let gamma_claim = match &prover_third_msg {
+            ahp::prover::ProverMsg::FieldElements(v) => v[0],
+            _ => unreachable!(),
+        };
         fs_rng.absorb(&to_bytes![third_comms, prover_third_msg].unwrap());
 
-        let verifier_state = AHPForR1CS::verifier_third_round(verifier_state, &mut fs_rng);
+        let (verifier_third_msg, verifier_state) =
+            AHPForR1CS::verifier_third_round(verifier_state, gamma_claim, &mut fs_rng);
+        // --------------------------------------------------------------------
+
+        // --------------------------------------------------------------------
+        // Fourth round: prover sends g_2(X) and h_2(X)
+        let (prover_fourth_msg, prover_fourth_oracles) =
+            AHPForR1CS::prover_fourth_round(&verifier_third_msg, prover_state, zk_rng)?;
+
+        let fourth_round_comm_time = start_timer!(|| "Committing to fourth round polys");
+        let (fourth_comms, fourth_comm_rands) = PC::commit(
+            &index_pk.committer_key,
+            prover_fourth_oracles.iter(),
+            Some(zk_rng),
+        )
+        .map_err(Error::from_pc_err)?;
+        end_timer!(fourth_round_comm_time);
+
+        fs_rng.absorb(&to_bytes![fourth_comms, prover_fourth_msg].unwrap());
         // --------------------------------------------------------------------
 
         // Gather prover polynomials in one vector.
@@ -230,6 +253,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
             .chain(prover_first_oracles.iter())
             .chain(prover_second_oracles.iter())
             .chain(prover_third_oracles.iter())
+            .chain(prover_fourth_oracles.iter())
             .collect();
 
         // Gather commitments in one vector.
@@ -238,6 +262,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
             first_comms.iter().map(|p| p.commitment().clone()).collect(),
             second_comms.iter().map(|p| p.commitment().clone()).collect(),
             third_comms.iter().map(|p| p.commitment().clone()).collect(),
+            fourth_comms.iter().map(|p| p.commitment().clone()).collect(),
         ];
         let labeled_comms: Vec<_> = index_pk
             .index_vk
@@ -248,6 +273,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
             .chain(first_comms.iter().cloned())
             .chain(second_comms.iter().cloned())
             .chain(third_comms.iter().cloned())
+            .chain(fourth_comms.iter().cloned())
             .collect();
 
         // Gather commitment randomness together.
@@ -258,6 +284,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
             .chain(first_comm_rands)
             .chain(second_comm_rands)
             .chain(third_comm_rands)
+            .chain(fourth_comm_rands)
             .collect();
 
         // Compute the AHP verifier's query set.
@@ -302,7 +329,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
         .map_err(Error::from_pc_err)?;
 
         // Gather prover messages together.
-        let prover_messages = vec![prover_first_msg, prover_second_msg, prover_third_msg];
+        let prover_messages = vec![prover_first_msg, prover_second_msg, prover_third_msg, prover_fourth_msg];
 
         let proof = Proof::new(commitments, evaluations, prover_messages, pc_proof);
         proof.print_size_info();
@@ -354,11 +381,22 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
         // --------------------------------------------------------------------
 
         // --------------------------------------------------------------------
-        // Third round
+        // Third round: absorb f commitment and γ message; derive ζ
         let third_comms = &proof.commitments[2];
         fs_rng.absorb(&to_bytes![third_comms, proof.prover_messages[2]].unwrap());
 
-        let verifier_state = AHPForR1CS::verifier_third_round(verifier_state, &mut fs_rng);
+        let gamma_claim = match &proof.prover_messages[2] {
+            ahp::prover::ProverMsg::FieldElements(v) => v[0],
+            _ => return Err(ahp::Error::MissingEval("gamma_claim".into()).into()),
+        };
+        let (_, verifier_state) =
+            AHPForR1CS::verifier_third_round(verifier_state, gamma_claim, &mut fs_rng);
+        // --------------------------------------------------------------------
+
+        // --------------------------------------------------------------------
+        // Fourth round
+        let fourth_comms = &proof.commitments[3];
+        fs_rng.absorb(&to_bytes![fourth_comms, proof.prover_messages[3]].unwrap());
         // --------------------------------------------------------------------
 
         // Collect degree bounds for commitments. Indexed polynomials have *no*
@@ -370,6 +408,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
             .chain(AHPForR1CS::prover_first_round_degree_bounds(&index_info))
             .chain(AHPForR1CS::prover_second_round_degree_bounds(&index_info))
             .chain(AHPForR1CS::prover_third_round_degree_bounds(&index_info))
+            .chain(AHPForR1CS::prover_fourth_round_degree_bounds(&index_info))
             .collect::<Vec<_>>();
 
         // Gather commitments in one vector.
@@ -378,6 +417,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
             .chain(first_comms)
             .chain(second_comms)
             .chain(third_comms)
+            .chain(fourth_comms)
             .cloned()
             .zip(AHPForR1CS::<F>::polynomial_labels())
             .zip(degree_bounds)

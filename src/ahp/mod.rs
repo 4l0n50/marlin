@@ -37,12 +37,14 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
     /// The labels for the polynomials output by the AHP prover.
     #[rustfmt::skip]
-    pub const PROVER_POLYNOMIALS: [&'static str; 10] = [
+    pub const PROVER_POLYNOMIALS: [&'static str; 11] = [
         // First round
         "w", "z_a", "z_b", "s_1", "s_2",
         // Second round
         "t", "g_1", "h_1",
         // Third round
+        "f",
+        // Fourth round
         "g_2", "h_2",
     ];
 
@@ -88,6 +90,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
             domain_k_size + 1, // s_2
             domain_h_size,
             domain_h_size,
+            domain_k_size,     // f (blinded with v_K, degree |K|)
             domain_k_size - 1,
         ]
         .iter()
@@ -104,7 +107,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let k_size = GeneralEvaluationDomain::<F>::compute_size_of_domain(num_non_zero).unwrap();
 
         degree_bounds[0] = h_size - 2;
-        degree_bounds[1] = k_size - 2;
+        degree_bounds[1] = k_size - 1; // g_2 degree bound (f is blinded with v_K)
         degree_bounds
     }
 
@@ -136,7 +139,9 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let eta_c = first_round_msg.eta_c;
 
         let beta = state.second_round_msg.unwrap().beta;
-        let gamma = state.gamma.unwrap();
+        let zeta = state.third_round_msg.unwrap().zeta;
+        // γ = Φ(α,β) = t(β): sent by the prover as the round-3 message
+        let gamma_claim = state.gamma_claim.unwrap();
 
         let mut linear_combinations = Vec::new();
 
@@ -184,20 +189,28 @@ impl<F: PrimeField> AHPForR1CS<F> {
         linear_combinations.push(t);
         linear_combinations.push(outer_sumcheck);
 
-        //  Inner sumcheck:
+        //  Inner sumcheck (evaluated at ζ):
+        // f(ζ)·b(ζ) - a(ζ) + h_2(ζ)·v_K(ζ) + ζ·(s_2(ζ)·v_H(β) + f(ζ) - ζ·g_2(ζ) - γ/|K|) = 0
         let beta_alpha = beta * alpha;
+        let f_lc = LinearCombination::new("f", vec![(F::one(), "f")]);
         let g_2 = LinearCombination::new("g_2", vec![(F::one(), "g_2")]);
+        let s_2 = LinearCombination::new("s_2", vec![(F::one(), "s_2")]);
 
-        let g_2_at_gamma = evals.get_lc_eval(&g_2, gamma)?;
+        let f_at_zeta = evals.get_lc_eval(&f_lc, zeta)?;
+        let g_2_at_zeta = evals.get_lc_eval(&g_2, zeta)?;
+        let s_2_at_zeta = evals.get_lc_eval(&s_2, zeta)?;
 
-        let v_K_at_gamma = domain_k.evaluate_vanishing_polynomial(gamma);
+        let v_K_at_zeta = domain_k.evaluate_vanishing_polynomial(zeta);
 
+        // a(ζ) = v_H(α)·v_H(β)·(η_a·a_val(ζ) + η_b·b_val(ζ) + η_c·c_val(ζ))
         let mut a = LinearCombination::new(
             "a_poly",
             vec![(eta_a, "a_val"), (eta_b, "b_val"), (eta_c, "c_val")],
         );
         a *= v_H_at_alpha * v_H_at_beta;
 
+        // b(ζ) = (αβ - α·row(ζ) - β·col(ζ) + rowcol(ζ))
+        // The verifier multiplies b by f(ζ) to get b(ζ)·f(ζ)
         let mut b = LinearCombination::new(
             "denom",
             vec![
@@ -207,17 +220,22 @@ impl<F: PrimeField> AHPForR1CS<F> {
                 (F::one(), "row_col".into()),
             ],
         );
-        b *= gamma * g_2_at_gamma + &(t_at_beta / k_size);
+        b *= f_at_zeta;
 
-        let s_2 = LinearCombination::new("s_2", vec![(F::one(), "s_2")]);
+        // ζ-correction: ζ·(s_2(ζ)·v_H(β) + f(ζ) - ζ·g_2(ζ) - γ/|K|)
+        let zeta_correction = zeta * (s_2_at_zeta * v_H_at_beta + f_at_zeta
+            - zeta * g_2_at_zeta
+            - gamma_claim / k_size);
 
         let mut inner_sumcheck = a;
         inner_sumcheck -= &b;
-        inner_sumcheck -= &LinearCombination::new("h_2", vec![(v_K_at_gamma, "h_2")]);
+        inner_sumcheck -= &LinearCombination::new("h_2", vec![(v_K_at_zeta, "h_2")]);
+        inner_sumcheck += &LinearCombination::new("zeta_correction", vec![(zeta_correction, LCTerm::One)]);
 
         inner_sumcheck.label = "inner_sumcheck".into();
-        debug_assert!(evals.get_lc_eval(&inner_sumcheck, gamma)?.is_zero());
+        debug_assert!(evals.get_lc_eval(&inner_sumcheck, zeta)?.is_zero());
 
+        linear_combinations.push(f_lc);
         linear_combinations.push(g_2);
         linear_combinations.push(s_2);
         linear_combinations.push(inner_sumcheck);
