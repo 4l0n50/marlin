@@ -37,9 +37,9 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
     /// The labels for the polynomials output by the AHP prover.
     #[rustfmt::skip]
-    pub const PROVER_POLYNOMIALS: [&'static str; 11] = [
+    pub const PROVER_POLYNOMIALS: [&'static str; 12] = [
         // First round
-        "w", "z_a", "z_b", "s_1", "s_2",
+        "w", "z_a", "z_b", "z_c", "s_1", "s_2",
         // Second round
         "t", "g_1", "h_1",
         // Third round
@@ -155,7 +155,9 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let v_H_at_beta = domain_h.evaluate_vanishing_polynomial(beta);
         let v_X_at_beta = x_domain.evaluate_vanishing_polynomial(beta);
 
+        let z_c = LinearCombination::new("z_c", vec![(F::one(), "z_c")]);
         let z_b_at_beta = evals.get_lc_eval(&z_b, beta)?;
+        let z_c_at_beta = evals.get_lc_eval(&z_c, beta)?;
         let t_at_beta = evals.get_lc_eval(&t, beta)?;
         let g_1_at_beta = evals.get_lc_eval(&g_1, beta)?;
 
@@ -172,7 +174,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
             vec![
                 (F::one(), "s_1".into()),
 
-                (r_alpha_at_beta * (eta_a + eta_c * z_b_at_beta), "z_a".into()),
+                (r_alpha_at_beta * eta_a, "z_a".into()),
                 (r_alpha_at_beta * eta_b * z_b_at_beta, LCTerm::One),
 
                 (-t_at_beta * v_X_at_beta, "w".into()),
@@ -180,11 +182,16 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
                 (-v_H_at_beta, "h_1".into()),
                 (-beta * g_1_at_beta, LCTerm::One),
+
+                // η_C·(z_A(β)·z_B(β) - z_C(β)) zero-check term
+                (eta_c * z_b_at_beta, "z_a".into()),
+                (-eta_c, "z_c".into()),
             ],
         );
         debug_assert!(evals.get_lc_eval(&outer_sumcheck, beta)?.is_zero());
 
         linear_combinations.push(z_b);
+        linear_combinations.push(z_c);
         linear_combinations.push(g_1);
         linear_combinations.push(t);
         linear_combinations.push(outer_sumcheck);
@@ -202,10 +209,10 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         let v_K_at_zeta = domain_k.evaluate_vanishing_polynomial(zeta);
 
-        // a(ζ) = v_H(α)·v_H(β)·(η_a·a_val(ζ) + η_b·b_val(ζ) + η_c·c_val(ζ))
+        // a(ζ) = v_H(α)·v_H(β)·(η_A·a_val(ζ) + η_B·b_val(ζ))  — C excluded from inner sumcheck
         let mut a = LinearCombination::new(
             "a_poly",
-            vec![(eta_a, "a_val"), (eta_b, "b_val"), (eta_c, "c_val")],
+            vec![(eta_a, "a_val"), (eta_b, "b_val")],
         );
         a *= v_H_at_alpha * v_H_at_beta;
 

@@ -31,11 +31,14 @@ pub struct ProverState<'a, F: PrimeField> {
     z_a: Option<Vec<F>>,
     /// Bz
     z_b: Option<Vec<F>>,
+    /// Cz
+    z_c: Option<Vec<F>>,
     /// query bound b
     zk_bound: usize,
 
     w_poly: Option<LabeledPolynomial<F>>,
     mz_polys: Option<(LabeledPolynomial<F>, LabeledPolynomial<F>)>,
+    z_c_poly: Option<LabeledPolynomial<F>>,
 
     index: &'a Index<F>,
 
@@ -181,6 +184,8 @@ pub struct ProverFirstOracles<F: Field> {
     pub z_a: LabeledPolynomial<F>,
     /// The LDE of `Bz`.
     pub z_b: LabeledPolynomial<F>,
+    /// The LDE of `Cz`.
+    pub z_c: LabeledPolynomial<F>,
     /// s_1: blinding polynomial for the first sumcheck.
     pub s_1: LabeledPolynomial<F>,
     /// s_2: blinding polynomial for the second sumcheck.
@@ -190,7 +195,7 @@ pub struct ProverFirstOracles<F: Field> {
 impl<F: Field> ProverFirstOracles<F> {
     /// Iterate over the polynomials output by the prover in the first round.
     pub fn iter(&self) -> impl Iterator<Item = &LabeledPolynomial<F>> {
-        vec![&self.w, &self.z_a, &self.z_b, &self.s_1, &self.s_2].into_iter()
+        vec![&self.w, &self.z_a, &self.z_b, &self.z_c, &self.s_1, &self.s_2].into_iter()
     }
 }
 
@@ -308,6 +313,10 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let z_b = index.b.iter().map(|row| inner_prod_fn(row)).collect();
         end_timer!(eval_z_b_time);
 
+        let eval_z_c_time = start_timer!(|| "Evaluating z_C");
+        let z_c = index.c.iter().map(|row| inner_prod_fn(row)).collect();
+        end_timer!(eval_z_c_time);
+
         let zk_bound = 1; // One query is sufficient for our desired soundness
 
         let domain_h = GeneralEvaluationDomain::new(num_constraints)
@@ -326,8 +335,10 @@ impl<F: PrimeField> AHPForR1CS<F> {
             witness_assignment,
             z_a: Some(z_a),
             z_b: Some(z_b),
+            z_c: Some(z_c),
             w_poly: None,
             mz_polys: None,
+            z_c_poly: None,
             zk_bound,
             index,
             verifier_first_msg: None,
@@ -405,6 +416,12 @@ impl<F: PrimeField> AHPForR1CS<F> {
             + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H);
         end_timer!(z_b_poly_time);
 
+        let z_c_poly_time = start_timer!(|| "Computing z_C polynomial");
+        let z_c = state.z_c.clone().unwrap();
+        let z_c_poly_r1 = &EvaluationsOnDomain::from_vec_and_domain(z_c, domain_h).interpolate()
+            + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H);
+        end_timer!(z_c_poly_time);
+
         // s_1(X) = q_{s1} * z_H(X) + X * r_{s1}  (degree |H| + 1)
         // Sum over H is zero by construction (z_H vanishes on H; X*r_{s1} sums to 0).
         let s_1_time = start_timer!(|| "Computing s_1 polynomial");
@@ -435,12 +452,14 @@ impl<F: PrimeField> AHPForR1CS<F> {
         assert!(w_poly.degree() < domain_h.size() - domain_x.size() + zk_bound);
         assert!(z_a_poly.degree() < domain_h.size() + zk_bound);
         assert!(z_b_poly.degree() < domain_h.size() + zk_bound);
+        assert!(z_c_poly_r1.degree() < domain_h.size() + zk_bound);
         assert!(s_1_poly.degree() <= domain_h.size() + 1);
         assert!(s_2_poly.degree() <= domain_k.size() + 1);
 
         let w = LabeledPolynomial::new("w".to_string(), w_poly, None, Some(1));
         let z_a = LabeledPolynomial::new("z_a".to_string(), z_a_poly, None, Some(1));
         let z_b = LabeledPolynomial::new("z_b".to_string(), z_b_poly, None, Some(1));
+        let z_c_committed = LabeledPolynomial::new("z_c".to_string(), z_c_poly_r1, None, Some(1));
         let s_1 = LabeledPolynomial::new("s_1".to_string(), s_1_poly, None, None);
         let s_2 = LabeledPolynomial::new("s_2".to_string(), s_2_poly, None, None);
 
@@ -448,12 +467,14 @@ impl<F: PrimeField> AHPForR1CS<F> {
             w: w.clone(),
             z_a: z_a.clone(),
             z_b: z_b.clone(),
+            z_c: z_c_committed.clone(),
             s_1: s_1.clone(),
             s_2: s_2.clone(),
         };
 
         state.w_poly = Some(w);
         state.mz_polys = Some((z_a, z_b));
+        state.z_c_poly = Some(z_c_committed);
         state.s_1 = Some(s_1);
         state.s_2 = Some(s_2);
         state.sigma = Some(sigma);
@@ -490,14 +511,14 @@ impl<F: PrimeField> AHPForR1CS<F> {
     pub fn prover_first_round_degree_bounds(
         _info: &IndexInfo<F>,
     ) -> impl Iterator<Item = Option<usize>> {
-        vec![None; 5].into_iter()
+        vec![None; 6].into_iter()
     }
 
     /// Output the second round message and the next state.
     pub fn prover_second_round<'a, R: RngCore>(
         ver_message: &VerifierFirstMsg<F>,
         mut state: ProverState<'a, F>,
-        _r: &mut R,
+        zk_rng: &mut R,
     ) -> (ProverMsg<F>, ProverSecondOracles<F>, ProverState<'a, F>) {
         let round_time = start_timer!(|| "AHP::Prover::SecondRound");
 
@@ -518,20 +539,24 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         let summed_z_m_poly_time = start_timer!(|| "Compute z_m poly");
         let (z_a_poly, z_b_poly) = state.mz_polys.as_ref().unwrap();
-        let z_c_poly = z_a_poly.polynomial() * z_b_poly.polynomial();
 
-        let mut summed_z_m_coeffs = z_c_poly.coeffs;
-        // Note: Can't combine these two loops, because z_c_poly has 2x the degree
-        // of z_a_poly and z_b_poly, so the second loop gets truncated due to
-        // the `zip`s.
-        cfg_iter_mut!(summed_z_m_coeffs).for_each(|c| *c *= &eta_c);
-        cfg_iter_mut!(summed_z_m_coeffs)
-            .zip(&z_a_poly.polynomial().coeffs)
-            .zip(&z_b_poly.polynomial().coeffs)
-            .for_each(|((c, a), b)| *c += &(eta_a * a + &(eta_b * b)));
-
-        let summed_z_m = DensePolynomial::from_coefficients_vec(summed_z_m_coeffs);
+        // summed_z_m = η_A·z_A + η_B·z_B  (C excluded; η_C enters via zero-check below)
+        let summed_z_m = {
+            let mut coeffs = vec![F::zero(); domain_h.size() + zk_bound];
+            cfg_iter_mut!(coeffs)
+                .zip(&z_a_poly.polynomial().coeffs)
+                .zip(&z_b_poly.polynomial().coeffs)
+                .for_each(|((c, a), b)| *c += eta_a * a + eta_b * b);
+            DensePolynomial::from_coefficients_vec(coeffs)
+        };
         end_timer!(summed_z_m_poly_time);
+
+        let v_H_poly: DensePolynomial<F> = domain_h.vanishing_polynomial().into();
+        // Use the committed z_c polynomial from round 1
+        let z_c_poly = state.z_c_poly.as_ref()
+            .expect("ProverState should include z_c_poly when prover_second_round is called")
+            .polynomial()
+            .clone();
 
         let r_alpha_x_evals_time = start_timer!(|| "Compute r_alpha_x evals");
         let r_alpha_x_evals =
@@ -543,17 +568,15 @@ impl<F: PrimeField> AHPForR1CS<F> {
         end_timer!(r_alpha_poly_time);
 
         let t_poly_time = start_timer!(|| "Compute t poly");
+        // t = Σ_{M∈{A,B}} η_M M̂*(α,X) + σ·v_H(X)  (C excluded; η_C enters via zero-check)
         let mut t_poly = Self::calculate_t(
-            vec![&state.index.a, &state.index.b, &state.index.c].into_iter(),
-            &[eta_a, eta_b, eta_c],
+            vec![&state.index.a, &state.index.b].into_iter(),
+            &[eta_a, eta_b],
             state.domain_x,
             state.domain_h,
             r_alpha_x_evals,
         );
-        // Blind t: t(X) += σ·v_H(X), where ρ_t = σ (same scalar as in s_2).
-        // This ensures γ = Φ(α,β) = t(β), linking the outer and inner sumchecks.
         let sigma = state.sigma.expect("ProverState should include sigma when prover_second_round is called");
-        let v_H_poly: DensePolynomial<F> = domain_h.vanishing_polynomial().into();
         t_poly += &(&DensePolynomial::from_coefficients_slice(&[sigma]) * &v_H_poly);
         end_timer!(t_poly_time);
 
@@ -578,10 +601,14 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         let q_1_time = start_timer!(|| "Compute q_1 poly");
 
+        // z_a * z_b product (degree 2(|H|+zk-1))
+        let z_a_times_z_b = z_a_poly.polynomial() * z_b_poly.polynomial();
+
         let mul_domain_size = *[
             s_1.len(),
             r_alpha_poly.coeffs.len() + summed_z_m.coeffs.len(),
             t_poly.coeffs.len() + z_poly.len(),
+            z_a_times_z_b.coeffs.len(), // for the η_C zero-check term
         ]
         .iter()
         .max()
@@ -592,14 +619,19 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let summed_z_m_evals = summed_z_m.evaluate_over_domain_by_ref(mul_domain);
         let z_poly_evals = z_poly.evaluate_over_domain_by_ref(mul_domain);
         let t_poly_m_evals = t_poly.evaluate_over_domain_by_ref(mul_domain);
+        let z_a_z_b_evals = z_a_times_z_b.evaluate_over_domain_by_ref(mul_domain);
+        let z_c_evals_mul = z_c_poly.evaluate_over_domain_by_ref(mul_domain);
 
         cfg_iter_mut!(r_alpha_evals.evals)
             .zip(&summed_z_m_evals.evals)
             .zip(&z_poly_evals.evals)
             .zip(&t_poly_m_evals.evals)
-            .for_each(|(((a, b), &c), d)| {
-                *a *= b;
-                *a -= c * d;
+            .zip(&z_a_z_b_evals.evals)
+            .zip(&z_c_evals_mul.evals)
+            .for_each(|(((((r_a, z_m), &z), t), z_a_z_b), z_c)| {
+                *r_a *= z_m;              // r_α · (η_A·z_A + η_B·z_B)
+                *r_a -= z * t;           // - t · z
+                *r_a += eta_c * (*z_a_z_b - z_c); // + η_C·(z_A·z_B - z_C)
             });
         let rhs = r_alpha_evals.interpolate();
         let q_1 = s_1.polynomial() + &rhs;
@@ -694,18 +726,13 @@ impl<F: PrimeField> AHPForR1CS<F> {
             .collect();
         ark_ff::batch_inversion(&mut inverses);
 
-        let (val_a_on_K, val_b_on_K, val_c_on_K) = (
+        let (val_a_on_K, val_b_on_K) = (
             &joint_arith.evals_on_K.val_a,
             &joint_arith.evals_on_K.val_b,
-            &joint_arith.evals_on_K.val_c,
         );
+        // f only sums over M ∈ {A, B}; C is excluded from the inner sumcheck
         let f_evals_on_K: Vec<_> = cfg_into_iter!(0..(domain_k.size()))
-            .map(|i| {
-                inverses[i]
-                    * (eta_a_vv * val_a_on_K[i]
-                        + eta_b_vv * val_b_on_K[i]
-                        + eta_c_vv * val_c_on_K[i])
-            })
+            .map(|i| inverses[i] * (eta_a_vv * val_a_on_K[i] + eta_b_vv * val_b_on_K[i]))
             .collect();
         end_timer!(f_evals_time);
 
@@ -798,19 +825,17 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let v_H_alpha_v_H_beta = v_H_at_alpha * v_H_at_beta;
         let eta_a_vv = eta_a * v_H_alpha_v_H_beta;
         let eta_b_vv = eta_b * v_H_alpha_v_H_beta;
-        let eta_c_vv = eta_c * v_H_alpha_v_H_beta;
 
         let joint_arith = &index.joint_arith;
 
+        // a(X) = v_H(α)·v_H(β)·(η_A·val_A(X) + η_B·val_B(X))  — C excluded
         let a_poly_time = start_timer!(|| "Computing a poly");
         let a_poly = {
             let a = joint_arith.val_a.coeffs();
             let b = joint_arith.val_b.coeffs();
-            let c = joint_arith.val_c.coeffs();
             let coeffs: Vec<F> = cfg_iter!(a)
                 .zip(b)
-                .zip(c)
-                .map(|((a, b), c)| eta_a_vv * a + eta_b_vv * b + eta_c_vv * c)
+                .map(|(a, b)| eta_a_vv * a + eta_b_vv * b)
                 .collect();
             DensePolynomial::from_coefficients_vec(coeffs)
         };

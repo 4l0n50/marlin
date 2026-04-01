@@ -153,6 +153,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         //  LinearCombination::new("t", vec![(F::one(), t)])
         query_set.insert(("g_1".into(), ("beta".into(), beta)));
         query_set.insert(("z_b".into(), ("beta".into(), beta)));
+        query_set.insert(("z_c".into(), ("beta".into(), beta)));
         query_set.insert(("t".into(), ("beta".into(), beta)));
         query_set.insert(("outer_sumcheck".into(), ("beta".into(), beta)));
 
