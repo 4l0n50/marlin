@@ -182,6 +182,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         // let inner_sumcheck = a_poly_lc - (b_lc * (gamma * &g_2_at_gamma + &(t_at_beta / &k_size))) - h_lc
         // main_lc.set_label("inner_sumcheck");
         query_set.insert(("g_2".into(), ("gamma".into(), gamma)));
+        query_set.insert(("s_2".into(), ("gamma".into(), gamma)));
         query_set.insert(("inner_sumcheck".into(), ("gamma".into(), gamma)));
 
         (query_set, state)

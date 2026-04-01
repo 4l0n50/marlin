@@ -1812,7 +1812,7 @@ mod tests {
                 &public_inputs.col_comm,
                 &public_inputs.rowcol_comm
             ),
-            "verification failed for n={n}, m={m}, t={t}, row={row:?}, col={col:?}",
+            "verification failed for n={}, m={}, t={}, row={:?}, col={:?}", n, m, t, row, col,
         );
     }
 

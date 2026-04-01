@@ -37,10 +37,12 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
     /// The labels for the polynomials output by the AHP prover.
     #[rustfmt::skip]
-    pub const PROVER_POLYNOMIALS: [&'static str; 9] = [
-        // First sumcheck
-        "w", "z_a", "z_b", "mask_poly", "t", "g_1", "h_1",
-        // Second sumcheck
+    pub const PROVER_POLYNOMIALS: [&'static str; 10] = [
+        // First round
+        "w", "z_a", "z_b", "s_1", "s_2",
+        // Second round
+        "t", "g_1", "h_1",
+        // Third round
         "g_2", "h_2",
     ];
 
@@ -82,7 +84,8 @@ impl<F: PrimeField> AHPForR1CS<F> {
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
         Ok(*[
             2 * domain_h_size + zk_bound - 2,
-            3 * domain_h_size + 2 * zk_bound - 3, //  mask_poly
+            domain_h_size + 1, // s_1
+            domain_k_size + 1, // s_2
             domain_h_size,
             domain_h_size,
             domain_k_size - 1,
@@ -162,7 +165,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let outer_sumcheck = LinearCombination::new(
             "outer_sumcheck",
             vec![
-                (F::one(), "mask_poly".into()),
+                (F::one(), "s_1".into()),
 
                 (r_alpha_at_beta * (eta_a + eta_c * z_b_at_beta), "z_a".into()),
                 (r_alpha_at_beta * eta_b * z_b_at_beta, LCTerm::One),
@@ -206,6 +209,8 @@ impl<F: PrimeField> AHPForR1CS<F> {
         );
         b *= gamma * g_2_at_gamma + &(t_at_beta / k_size);
 
+        let s_2 = LinearCombination::new("s_2", vec![(F::one(), "s_2")]);
+
         let mut inner_sumcheck = a;
         inner_sumcheck -= &b;
         inner_sumcheck -= &LinearCombination::new("h_2", vec![(v_K_at_gamma, "h_2")]);
@@ -214,6 +219,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         debug_assert!(evals.get_lc_eval(&inner_sumcheck, gamma)?.is_zero());
 
         linear_combinations.push(g_2);
+        linear_combinations.push(s_2);
         linear_combinations.push(inner_sumcheck);
 
         linear_combinations.sort_by(|a, b| a.label.cmp(&b.label));

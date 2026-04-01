@@ -42,8 +42,14 @@ pub struct ProverState<'a, F: PrimeField> {
     /// the random values sent by the verifier in the first round
     verifier_first_msg: Option<VerifierFirstMsg<F>>,
 
-    /// the blinding polynomial for the first round
-    mask_poly: Option<LabeledPolynomial<F>>,
+    /// s_1: the blinding polynomial for the first sumcheck (degree |H|+1)
+    s_1: Option<LabeledPolynomial<F>>,
+
+    /// s_2: the blinding polynomial for the second sumcheck (degree |K|+1)
+    s_2: Option<LabeledPolynomial<F>>,
+
+    /// σ: the blinding scalar used to construct s_2; needed in round 3
+    sigma: Option<F>,
 
     /// domain X, sized for the public input
     domain_x: GeneralEvaluationDomain<F>,
@@ -163,14 +169,16 @@ pub struct ProverFirstOracles<F: Field> {
     pub z_a: LabeledPolynomial<F>,
     /// The LDE of `Bz`.
     pub z_b: LabeledPolynomial<F>,
-    /// The sum-check hiding polynomial.
-    pub mask_poly: LabeledPolynomial<F>,
+    /// s_1: blinding polynomial for the first sumcheck.
+    pub s_1: LabeledPolynomial<F>,
+    /// s_2: blinding polynomial for the second sumcheck.
+    pub s_2: LabeledPolynomial<F>,
 }
 
 impl<F: Field> ProverFirstOracles<F> {
     /// Iterate over the polynomials output by the prover in the first round.
     pub fn iter(&self) -> impl Iterator<Item = &LabeledPolynomial<F>> {
-        vec![&self.w, &self.z_a, &self.z_b, &self.mask_poly].into_iter()
+        vec![&self.w, &self.z_a, &self.z_b, &self.s_1, &self.s_2].into_iter()
     }
 }
 
@@ -298,7 +306,9 @@ impl<F: PrimeField> AHPForR1CS<F> {
             zk_bound,
             index,
             verifier_first_msg: None,
-            mask_poly: None,
+            s_1: None,
+            s_2: None,
+            sigma: None,
             domain_h,
             domain_k,
             domain_x,
@@ -366,43 +376,58 @@ impl<F: PrimeField> AHPForR1CS<F> {
             + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H);
         end_timer!(z_b_poly_time);
 
-        let mask_poly_time = start_timer!(|| "Computing mask polynomial");
-        let mask_poly_degree = 3 * domain_h.size() + 2 * zk_bound - 3;
-        let mut mask_poly = DensePolynomial::rand(mask_poly_degree, rng);
+        // s_1(X) = q_{s1} * z_H(X) + X * r_{s1}  (degree |H| + 1)
+        // Sum over H is zero by construction (z_H vanishes on H; X*r_{s1} sums to 0).
+        let s_1_time = start_timer!(|| "Computing s_1 polynomial");
+        let q_s1 = F::rand(rng);
+        let r_s1 = F::rand(rng);
+        let v_H_poly: DensePolynomial<F> = domain_h.vanishing_polynomial().into();
+        // q_{s1} * z_H(X)
+        let s_1_poly = &DensePolynomial::from_coefficients_slice(&[q_s1]) * &v_H_poly
+            // + X * r_{s1}
+            + DensePolynomial::from_coefficients_slice(&[F::zero(), r_s1]);
+        end_timer!(s_1_time);
 
-        let nh = domain_h.size();
-        let upper_bound = mask_poly_degree / nh;
-        let mut r_0 = F::zero();
-        for i in 0..upper_bound + 1 {
-            r_0 += mask_poly[nh * i];
-        }
-
-        mask_poly[0] -= &r_0;
-        end_timer!(mask_poly_time);
+        // s_2(X) = q_{s2} * z_K(X) + X * r_{s2} + σ/|K|  (degree |K| + 1)
+        // Sum over K equals σ: z_K vanishes on K, X*r_{s2} sums to 0, constant σ/|K| sums to σ.
+        let s_2_time = start_timer!(|| "Computing s_2 polynomial");
+        let domain_k = state.domain_k;
+        let v_K_poly: DensePolynomial<F> = domain_k.vanishing_polynomial().into();
+        let q_s2 = F::rand(rng);
+        let r_s2 = F::rand(rng);
+        let sigma = F::rand(rng);
+        let sigma_over_k = sigma / domain_k.size_as_field_element();
+        let s_2_poly = &DensePolynomial::from_coefficients_slice(&[q_s2]) * &v_K_poly
+            + DensePolynomial::from_coefficients_slice(&[sigma_over_k, r_s2]);
+        end_timer!(s_2_time);
 
         let msg = ProverMsg::EmptyMessage;
 
         assert!(w_poly.degree() < domain_h.size() - domain_x.size() + zk_bound);
         assert!(z_a_poly.degree() < domain_h.size() + zk_bound);
         assert!(z_b_poly.degree() < domain_h.size() + zk_bound);
-        assert!(mask_poly.degree() <= 3 * domain_h.size() + 2 * zk_bound - 3);
+        assert!(s_1_poly.degree() <= domain_h.size() + 1);
+        assert!(s_2_poly.degree() <= domain_k.size() + 1);
 
         let w = LabeledPolynomial::new("w".to_string(), w_poly, None, Some(1));
         let z_a = LabeledPolynomial::new("z_a".to_string(), z_a_poly, None, Some(1));
         let z_b = LabeledPolynomial::new("z_b".to_string(), z_b_poly, None, Some(1));
-        let mask_poly =
-            LabeledPolynomial::new("mask_poly".to_string(), mask_poly.clone(), None, None);
+        let s_1 = LabeledPolynomial::new("s_1".to_string(), s_1_poly, None, None);
+        let s_2 = LabeledPolynomial::new("s_2".to_string(), s_2_poly, None, None);
 
         let oracles = ProverFirstOracles {
             w: w.clone(),
             z_a: z_a.clone(),
             z_b: z_b.clone(),
-            mask_poly: mask_poly.clone(),
+            s_1: s_1.clone(),
+            s_2: s_2.clone(),
         };
 
         state.w_poly = Some(w);
         state.mz_polys = Some((z_a, z_b));
-        state.mask_poly = Some(mask_poly);
+        state.s_1 = Some(s_1);
+        state.s_2 = Some(s_2);
+        state.sigma = Some(sigma);
         end_timer!(round_time);
 
         Ok((msg, oracles, state))
@@ -436,7 +461,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
     pub fn prover_first_round_degree_bounds(
         _info: &IndexInfo<F>,
     ) -> impl Iterator<Item = Option<usize>> {
-        vec![None; 4].into_iter()
+        vec![None; 5].into_iter()
     }
 
     /// Output the second round message and the next state.
@@ -450,10 +475,10 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let domain_h = state.domain_h;
         let zk_bound = state.zk_bound;
 
-        let mask_poly = state
-            .mask_poly
+        let s_1 = state
+            .s_1
             .as_ref()
-            .expect("ProverState should include mask_poly when prover_second_round is called");
+            .expect("ProverState should include s_1 when prover_second_round is called");
 
         let VerifierFirstMsg {
             alpha,
@@ -520,7 +545,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let q_1_time = start_timer!(|| "Compute q_1 poly");
 
         let mul_domain_size = *[
-            mask_poly.len(),
+            s_1.len(),
             r_alpha_poly.coeffs.len() + summed_z_m.coeffs.len(),
             t_poly.coeffs.len() + z_poly.len(),
         ]
@@ -543,7 +568,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
                 *a -= c * d;
             });
         let rhs = r_alpha_evals.interpolate();
-        let q_1 = mask_poly.polynomial() + &rhs;
+        let q_1 = s_1.polynomial() + &rhs;
         end_timer!(q_1_time);
 
         let sumcheck_time = start_timer!(|| "Compute sumcheck h and g polys");
@@ -554,7 +579,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let msg = ProverMsg::EmptyMessage;
 
         assert!(g_1.degree() <= domain_h.size() - 2);
-        assert!(h_1.degree() <= 2 * domain_h.size() + 2 * zk_bound - 2);
+        assert!(h_1.degree() <= 2 * domain_h.size() + zk_bound - 1);
 
         let oracles = ProverSecondOracles {
             t: LabeledPolynomial::new("t".into(), t_poly, None, None),
@@ -682,6 +707,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         end_timer!(f_poly_time);
 
         let h_2_poly_time = start_timer!(|| "Computing sumcheck h poly");
+        // h_2·v_K = a - b·f  (inner sumcheck identity; s_2 is committed separately for ZK)
         let h_2 = (&a_poly - &(&b_poly * &f))
             .divide_by_vanishing_poly(domain_k)
             .unwrap()
@@ -694,7 +720,6 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         let msg = ProverMsg::EmptyMessage;
 
-        assert!(h_2.degree() <= domain_k.size() - 2);
         assert!(g_2.degree() <= domain_k.size() - 2);
         let oracles = ProverThirdOracles {
             g_2: LabeledPolynomial::new("g_2".to_string(), g_2, Some(domain_k.size() - 2), None),
