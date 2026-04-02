@@ -89,17 +89,14 @@ pub type Matrix<F> = Vec<Vec<(F, usize)>>;
 pub(crate) fn sum_matrices<F: PrimeField>(
     a: &Matrix<F>,
     b: &Matrix<F>,
-    c: &Matrix<F>,
 ) -> Vec<Vec<usize>> {
     a.iter()
         .zip(b)
-        .zip(c)
-        .map(|((row_a, row_b), row_c)| {
+        .map(|(row_a, row_b)| {
             row_a
                 .iter()
                 .map(|(_, i)| *i)
                 .chain(row_b.iter().map(|(_, i)| *i))
-                .chain(row_c.iter().map(|(_, i)| *i))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect()
@@ -145,7 +142,6 @@ impl<F: PrimeField> Index<F> {
             &self.joint_arith.col,
             &self.joint_arith.val_a,
             &self.joint_arith.val_b,
-            &self.joint_arith.val_c,
             &self.joint_arith.row_col,
         ]
         .into_iter()
@@ -176,9 +172,9 @@ impl<F: PrimeField> AHPForR1CS<F> {
         ics.finalize();
         make_matrices_square_for_indexer(ics.clone());
         let matrices = ics.to_matrices().expect("should not be `None`");
-        let joint_matrix = sum_matrices(&matrices.a, &matrices.b, &matrices.c);
+        let joint_matrix = sum_matrices(&matrices.a, &matrices.b);
         let num_non_zero_val = num_non_zero(&joint_matrix);
-        let (mut a, mut b, mut c) = (matrices.a, matrices.b, matrices.c);
+        let (a, b, c) = (matrices.a, matrices.b, matrices.c);
         end_timer!(matrix_processing_time);
 
         let (num_formatted_input_variables, num_witness_variables, num_constraints, num_non_zero) = (
@@ -223,9 +219,8 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let joint_arithmetization_time = start_timer!(|| "Arithmetizing all matrices");
         let joint_arith = arithmetize_matrix(
             &joint_matrix,
-            &mut a,
-            &mut b,
-            &mut c,
+            &a,
+            &b,
             domain_k,
             domain_h,
             x_domain,

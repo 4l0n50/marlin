@@ -233,6 +233,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
 
         // --------------------------------------------------------------------
         // Fourth round: prover sends g_2(X) and h_2(X)
+        let prover_output = prover_state.output_assignment.clone();
         let (prover_fourth_msg, prover_fourth_oracles) =
             AHPForR1CS::prover_fourth_round(&verifier_third_msg, prover_state, zk_rng)?;
 
@@ -294,6 +295,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
             AHPForR1CS::verifier_query_set(verifier_state, &mut fs_rng);
         let lc_s = AHPForR1CS::construct_linear_combinations(
             &public_input,
+            &prover_output,
             &polynomials,
             &verifier_state,
         )?;
@@ -344,6 +346,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
     pub fn verify<R: RngCore>(
         index_vk: &IndexVerifierKey<F, PC>,
         public_input: &[F],
+        public_output: &[F],
         proof: &Proof<F, PC>,
         rng: &mut R,
     ) -> Result<bool, Error<PC::Error>> {
@@ -448,6 +451,7 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
 
         let lc_s = AHPForR1CS::construct_linear_combinations(
             &public_input,
+            public_output,
             &evaluations,
             &verifier_state,
         )?;

@@ -39,8 +39,11 @@ pub struct ProverState<'a, F: PrimeField> {
     w_poly: Option<LabeledPolynomial<F>>,
     mz_polys: Option<(LabeledPolynomial<F>, LabeledPolynomial<F>)>,
     z_c_poly: Option<LabeledPolynomial<F>>,
-    /// y_poly: LDE of public output (0,...,0,y) over H
-    y_poly: Option<LabeledPolynomial<F>>,
+    /// y_poly: LDE of public output (0,...,0,y) over H (not committed; verifier computes y(β) directly)
+    y_poly: Option<DensePolynomial<F>>,
+    /// Public output values (last s witness variables); stored so the prover-side
+    /// construct_linear_combinations call can compute ŷ(β) without a commitment.
+    pub output_assignment: Vec<F>,
     /// v_Y_poly: vanishing polynomial over the last s elements of H
     v_Y_poly: Option<DensePolynomial<F>>,
 
@@ -193,8 +196,6 @@ pub struct ProverFirstOracles<F: Field> {
     pub z_b: LabeledPolynomial<F>,
     /// The LDE of `z_C = (0, w)` (zeros at x positions, witness elsewhere).
     pub z_c: LabeledPolynomial<F>,
-    /// The LDE of the public output `y` (zero at non-output positions).
-    pub y: LabeledPolynomial<F>,
     /// s_1: blinding polynomial for the first sumcheck.
     pub s_1: LabeledPolynomial<F>,
     /// s_2: blinding polynomial for the second sumcheck.
@@ -205,7 +206,7 @@ impl<F: Field> ProverFirstOracles<F> {
     /// Iterate over the polynomials output by the prover in the first round.
     pub fn iter(&self) -> impl Iterator<Item = &LabeledPolynomial<F>> {
         vec![
-            &self.w, &self.z_a, &self.z_b, &self.z_c, &self.y, &self.s_1, &self.s_2,
+            &self.w, &self.z_a, &self.z_b, &self.z_c, &self.s_1, &self.s_2,
         ]
         .into_iter()
     }
@@ -353,6 +354,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
             z_c_poly: None,
             y_poly: None,
             v_Y_poly: None,
+            output_assignment: Vec::new(),
             zk_bound,
             index,
             verifier_first_msg: None,
@@ -430,8 +432,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         for (i, &val) in y_vals.iter().enumerate() {
             y_evals_on_h[n - s + i] = val;
         }
-        let y_poly = &EvaluationsOnDomain::from_vec_and_domain(y_evals_on_h, domain_h).interpolate()
-            + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H);
+        let y_poly = EvaluationsOnDomain::from_vec_and_domain(y_evals_on_h, domain_h).interpolate();
         end_timer!(y_poly_time);
 
         // ẑ(X) = ŵ(X)·v_X(X)·v_Y(X) + x̂(X) + ŷ(X)
@@ -537,7 +538,6 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let z_a = LabeledPolynomial::new("z_a".to_string(), z_a_poly, None, Some(1));
         let z_b = LabeledPolynomial::new("z_b".to_string(), z_b_poly, None, Some(1));
         let z_c_committed = LabeledPolynomial::new("z_c".to_string(), z_c_poly_r1, None, Some(1));
-        let y = LabeledPolynomial::new("y".to_string(), y_poly, None, Some(1));
         let s_1 = LabeledPolynomial::new("s_1".to_string(), s_1_poly, None, None);
         let s_2 = LabeledPolynomial::new("s_2".to_string(), s_2_poly, None, None);
 
@@ -546,7 +546,6 @@ impl<F: PrimeField> AHPForR1CS<F> {
             z_a: z_a.clone(),
             z_b: z_b.clone(),
             z_c: z_c_committed.clone(),
-            y: y.clone(),
             s_1: s_1.clone(),
             s_2: s_2.clone(),
         };
@@ -554,7 +553,8 @@ impl<F: PrimeField> AHPForR1CS<F> {
         state.w_poly = Some(w);
         state.mz_polys = Some((z_a, z_b));
         state.z_c_poly = Some(z_c_committed);
-        state.y_poly = Some(y);
+        state.output_assignment = y_vals;
+        state.y_poly = Some(y_poly);
         state.v_Y_poly = Some(v_Y_poly);
         state.s_1 = Some(s_1);
         state.s_2 = Some(s_2);
@@ -592,7 +592,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
     pub fn prover_first_round_degree_bounds(
         _info: &IndexInfo<F>,
     ) -> impl Iterator<Item = Option<usize>> {
-        vec![None; 7].into_iter()
+        vec![None; 6].into_iter()
     }
 
     /// Output the second round message and the next state.
@@ -687,7 +687,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let y_poly = state.y_poly.as_ref().unwrap();
         // ẑ(X) = ŵ(X)·v_X(X)·v_Y(X) + x̂(X) + ŷ(X)
         let v_X_poly: DensePolynomial<F> = domain_x.vanishing_polynomial().into();
-        let z_poly = &(&(w_poly.polynomial() * &v_X_poly) * &v_Y_poly) + &(&x_poly + y_poly.polynomial());
+        let z_poly = &(&(w_poly.polynomial() * &v_X_poly) * &v_Y_poly) + &(&x_poly + y_poly);
         assert!(z_poly.degree() < domain_h.size() + zk_bound);
 
         end_timer!(z_poly_time);

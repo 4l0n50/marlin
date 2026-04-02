@@ -155,10 +155,10 @@ mod marlin {
             let proof = MarlinInst::prove(&index_pk, circ, rng).unwrap();
             println!("Called prover");
 
-            assert!(MarlinInst::verify(&index_vk, &[c, d], &proof, rng).unwrap());
+            assert!(MarlinInst::verify(&index_vk, &[c, d], &[], &proof, rng).unwrap());
             println!("Called verifier");
             println!("\nShould not verify (i.e. verifier messages should print below):");
-            assert!(!MarlinInst::verify(&index_vk, &[a, a], &proof, rng).unwrap());
+            assert!(!MarlinInst::verify(&index_vk, &[a, a], &[], &proof, rng).unwrap());
         }
     }
 
@@ -224,7 +224,7 @@ mod marlin {
             inputs.push(Fr::from(i as u128));
         }
 
-        assert!(MarlinInst::verify(&index_vk, &inputs, &proof, rng).unwrap());
+        assert!(MarlinInst::verify(&index_vk, &inputs, &[], &proof, rng).unwrap());
         println!("Called verifier");
     }
 }

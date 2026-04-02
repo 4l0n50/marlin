@@ -23,6 +23,27 @@ pub type LabeledPolynomial<F> = ark_poly_commit::LabeledPolynomial<F, DensePolyn
 /// The algebraic holographic proof defined in [CHMMVW19](https://eprint.iacr.org/2019/1047).
 /// Currently, this AHP only supports inputs of size one
 /// less than a power of 2 (i.e., of the form 2^n - 1).
+///
+/// # Notation differences from the paper (marlin_PHP.pdf)
+///
+/// | Paper                       | Code                  | Notes                                                       |
+/// |-----------------------------|-----------------------|-------------------------------------------------------------|
+/// | `ẑ_C(X)`                    | `z_c`                 | LDE of `Cz`; C is the output selector matrix                |
+/// | `ẑ_B(X)`                    | `z_b`                 | LDE of `Bz`                                                 |
+/// | `ŵ(X)`                      | `w`                   | LDE of the witness, divided by `v_X · v_Y`                  |
+/// | `ŷ(X)`                      | `y`                   | LDE of the public output vector                             |
+/// | `z_H[≤t](X)`                | `v_X` (domain X)      | Vanishing poly over first `t` elements of H (public inputs) |
+/// | `z_H[≥n−s+1](X)`            | `v_Y` (computed)      | Vanishing poly over last `s` elements of H (public outputs) |
+/// | `u_H(α, X)` (bivariate)     | `r_alpha_at_beta`     | Unnormalized bivariate Lagrange poly, evaluated at `(α, β)` |
+/// | `Φ(X, Y)`                   | —                     | `Σ_{M∈{A,B}} η_M M̂*(X,Y) + σ·z_H(Y)`                        |
+/// | `γ = Φ(α, β)`               | `gamma_claim`         | Inner sum; sent by prover in round 3                        |
+/// | `ρ_t(X)`                    | `rho_t`               | Degree-1 blinding poly for `t(X)`                           |
+/// | `t(X)`                      | `t`                   | `Σ η_M M̂*(α,X) + ρ_t(X)·z_H(X)`                             |
+/// | `η` (zero-check randomizer) | `eta`                 | First field in `VerifierFirstMsg`; not in paper's verifier msg but needed for `t − Φ` check |
+/// | `β'` (inner sumcheck point) | `zeta`                | Paper uses `β'`; code uses `zeta`                           |
+/// | `f_{β'}` / `f(β')`          | `f_at_zeta`           | Evaluation of the inner sumcheck witness poly               |
+/// | `δ` (KZG batching challenge)| not yet implemented   | Paper batches evaluation claims with `δ`                    |
+/// | `val_{A*}`, `val_{B*}`      | `a_val`, `b_val`      | Arithmetization of `A*` and `B*`                            |
 pub struct AHPForR1CS<F: Field> {
     field: PhantomData<F>,
 }
@@ -30,16 +51,16 @@ pub struct AHPForR1CS<F: Field> {
 impl<F: PrimeField> AHPForR1CS<F> {
     /// The labels for the polynomials output by the AHP indexer.
     #[rustfmt::skip]
-    pub const INDEXER_POLYNOMIALS: [&'static str; 6] = [
+    pub const INDEXER_POLYNOMIALS: [&'static str; 5] = [
         // Polynomials for M
-        "row", "col", "a_val", "b_val", "c_val", "row_col",
+        "row", "col", "a_val", "b_val", "row_col",
     ];
 
     /// The labels for the polynomials output by the AHP prover.
     #[rustfmt::skip]
-    pub const PROVER_POLYNOMIALS: [&'static str; 13] = [
+    pub const PROVER_POLYNOMIALS: [&'static str; 12] = [
         // First round
-        "w", "z_a", "z_b", "z_c", "y", "s_1", "s_2",
+        "w", "z_a", "z_b", "z_c", "s_1", "s_2",
         // Second round
         "t", "g_1", "h_1",
         // Third round
@@ -115,6 +136,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
     #[allow(non_snake_case)]
     pub fn construct_linear_combinations<E>(
         public_input: &[F],
+        public_output: &[F],
         evals: &E,
         state: &verifier::VerifierState<F>,
     ) -> Result<Vec<LinearCombination<F>>, Error>
@@ -133,43 +155,69 @@ impl<F: PrimeField> AHPForR1CS<F> {
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
 
         let first_round_msg = state.first_round_msg.unwrap();
-        let eta = first_round_msg.eta;
+        let eta = first_round_msg.eta; // randomizer for the t − Φ(α,·) zero-check
         let alpha = first_round_msg.alpha;
         let eta_a = first_round_msg.eta_a;
         let eta_b = first_round_msg.eta_b;
-        let eta_c = first_round_msg.eta_c;
+        let eta_c = first_round_msg.eta_c; // randomizer for the z_A·z_B − z_C check
 
         let beta = state.second_round_msg.unwrap().beta;
         let zeta = state.third_round_msg.unwrap().zeta;
-        // γ = Φ(α,β): sent by the prover as the round-3 message.
+        // γ = Φ(α,β): the inner sum claimed by the prover in round 3.
         let gamma_claim = state.gamma_claim.unwrap();
 
         let mut linear_combinations = Vec::new();
 
-        // Outer sumcheck:
+        // ----------------------------------------------------------------
+        // Outer sumcheck (evaluated at β):
+        //
+        //   s_1(β) + r(α,β)·(η_A·z_A(β) + η_B·z_B(β)) − t(β)·ẑ(β)
+        //   − v_H(β)·h_1(β) − β·g_1(β)
+        //   + η_C·(z_A(β)·z_B(β) − z_C(β))
+        //   + η·(t(β) − γ) = 0
+        //
+        // where ẑ(β) = w(β)·v_X(β)·v_Y(β) + x̂(β) + ŷ(β).
+        // ----------------------------------------------------------------
+
         let z_b = LinearCombination::new("z_b", vec![(F::one(), "z_b")]);
         let g_1 = LinearCombination::new("g_1", vec![(F::one(), "g_1")]);
         let t = LinearCombination::new("t", vec![(F::one(), "t")]);
 
+        // r(α,β) = unnormalized bivariate Lagrange polynomial; used in the lincheck.
         let r_alpha_at_beta = domain_h.eval_unnormalized_bivariate_lagrange_poly(alpha, beta);
         let v_H_at_alpha = domain_h.evaluate_vanishing_polynomial(alpha);
         let v_H_at_beta = domain_h.evaluate_vanishing_polynomial(beta);
+        // v_X(β): vanishing polynomial over the public input domain X.
         let v_X_at_beta = x_domain.evaluate_vanishing_polynomial(beta);
 
-        // v_Y(β): vanishing polynomial over the last s elements of H, evaluated at β.
-        // s = num_output_variables; last s elements of H are h_{n-s},...,h_{n-1}.
+        // v_Y(β): vanishing polynomial over the last s elements of H (public output positions).
+        // s is the actual count of output variables, not rounded to a power of 2.
         let s = state.num_output_variables;
         let h_elems: Vec<F> = domain_h.elements().collect();
         let n = domain_h.size();
         let v_Y_at_beta: F = h_elems[n - s..].iter().map(|&h| beta - h).product();
 
         let z_c = LinearCombination::new("z_c", vec![(F::one(), "z_c")]);
-        let y_lc = LinearCombination::new("y", vec![(F::one(), "y")]);
         let z_b_at_beta = evals.get_lc_eval(&z_b, beta)?;
-        let y_at_beta = evals.get_lc_eval(&y_lc, beta)?;
+        // ŷ(β): computed directly from public output values via Lagrange interpolation
+        // over the last s positions of H — no commitment needed.
+        let y_at_beta: F = h_elems[n - s..]
+            .iter()
+            .zip(public_output)
+            .map(|(&h_i, &y_i)| {
+                let lagrange_i: F = h_elems[n - s..]
+                    .iter()
+                    .filter(|&&h_j| h_j != h_i)
+                    .map(|&h_j| (beta - h_j) / (h_i - h_j))
+                    .product();
+                y_i * lagrange_i
+            })
+            .sum();
         let t_at_beta = evals.get_lc_eval(&t, beta)?;
         let g_1_at_beta = evals.get_lc_eval(&g_1, beta)?;
 
+        // x̂(β): evaluation of the public input polynomial at β, computed directly
+        // from the public input values via Lagrange interpolation (no commitment needed).
         let x_at_beta = x_domain
             .evaluate_all_lagrange_coefficients(beta)
             .into_iter()
@@ -181,24 +229,27 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let outer_sumcheck = LinearCombination::new(
             "outer_sumcheck",
             vec![
+                // Blinding polynomial s_1
                 (F::one(), "s_1".into()),
 
+                // r(α,β)·(η_A·z_A(β) + η_B·z_B(β)): lincheck for A and B
                 (r_alpha_at_beta * eta_a, "z_a".into()),
                 (r_alpha_at_beta * eta_b * z_b_at_beta, LCTerm::One),
 
-                // -t(β)·ẑ(β) where ẑ(β) = w(β)·v_X(β)·v_Y(β) + x̂(β) + ŷ(β)
+                // −t(β)·ẑ(β) where ẑ(β) = w(β)·v_X(β)·v_Y(β) + x̂(β) + ŷ(β)
                 (-t_at_beta * v_X_at_beta * v_Y_at_beta, "w".into()),
                 (-t_at_beta * x_at_beta, LCTerm::One),
                 (-t_at_beta * y_at_beta, LCTerm::One),
 
+                // Outer sumcheck quotient: −v_H(β)·h_1(β) − β·g_1(β)
                 (-v_H_at_beta, "h_1".into()),
                 (-beta * g_1_at_beta, LCTerm::One),
 
-                // η_C·(z_A(β)·z_B(β) - z_C(β)) zero-check term
+                // η_C·(z_A(β)·z_B(β) − z_C(β)): enforces A·z ∘ B·z = C·z
                 (eta_c * z_b_at_beta, "z_a".into()),
                 (-eta_c, "z_c".into()),
 
-                // η·(t(β) - γ) zero-check term: t = Φ(α,·) + ρ_t·v_H, so t - Φ(α,·) vanishes on H
+                // η·(t(β) − γ): t − Φ(α,·) vanishes on H, folded in via randomizer η
                 (eta, "t".into()),
                 (-eta * gamma_claim, LCTerm::One),
             ],
@@ -207,13 +258,21 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         linear_combinations.push(z_b);
         linear_combinations.push(z_c);
-        linear_combinations.push(y_lc);
         linear_combinations.push(g_1);
         linear_combinations.push(t);
         linear_combinations.push(outer_sumcheck);
 
-        //  Inner sumcheck (evaluated at ζ):
-        // f(ζ)·b(ζ) - a(ζ) + h_2(ζ)·v_K(ζ) + ζ·(s_2(ζ)·v_H(β) + f(ζ) - ζ·g_2(ζ) - γ/|K|) = 0
+        // ----------------------------------------------------------------
+        // Inner sumcheck (evaluated at ζ):
+        //
+        //   a(ζ) − f(ζ)·b(ζ) − v_K(ζ)·h_2(ζ)
+        //   + ζ·(s_2(ζ)·v_H(β) + f(ζ) − ζ·g_2(ζ) − γ/|K|) = 0
+        //
+        // where a(X) = v_H(α)·v_H(β)·(η_A·a_val(X) + η_B·b_val(X))
+        //       b(X) = αβ − α·row(X) − β·col(X) + row_col(X)
+        // C excluded from a(X): val_C not committed (C is a public selector).
+        // ----------------------------------------------------------------
+
         let beta_alpha = beta * alpha;
         let f_lc = LinearCombination::new("f", vec![(F::one(), "f")]);
         let g_2 = LinearCombination::new("g_2", vec![(F::one(), "g_2")]);
@@ -225,12 +284,12 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         let v_K_at_zeta = domain_k.evaluate_vanishing_polynomial(zeta);
 
-        // a(ζ) = v_H(α)·v_H(β)·(η_A·a_val(ζ) + η_B·b_val(ζ))  — C excluded from inner sumcheck
+        // a(ζ) = v_H(α)·v_H(β)·(η_A·a_val(ζ) + η_B·b_val(ζ))
         let mut a = LinearCombination::new("a_poly", vec![(eta_a, "a_val"), (eta_b, "b_val")]);
         a *= v_H_at_alpha * v_H_at_beta;
 
-        // b(ζ) = (αβ - α·row(ζ) - β·col(ζ) + rowcol(ζ))
-        // The verifier multiplies b by f(ζ) to get b(ζ)·f(ζ)
+        // b(ζ) = αβ − α·row(ζ) − β·col(ζ) + row_col(ζ)  (the denominator of the sumcheck fraction)
+        // Multiplied by f(ζ) so the inner sumcheck is a single LC evaluated at ζ.
         let mut b = LinearCombination::new(
             "denom",
             vec![
@@ -242,7 +301,9 @@ impl<F: PrimeField> AHPForR1CS<F> {
         );
         b *= f_at_zeta;
 
-        // ζ-correction: ζ·(s_2(ζ)·v_H(β) + f(ζ) - ζ·g_2(ζ) - γ/|K|)
+        // ζ-correction enforces the low-degree condition on f and the sumcheck equation:
+        //   s_2(ζ)·v_H(β) + f(ζ) − ζ·g_2(ζ) − γ/|K| = 0
+        // Multiplied by ζ so it can be added to the inner_sumcheck LC.
         let zeta_correction = zeta
             * (s_2_at_zeta * v_H_at_beta + f_at_zeta - zeta * g_2_at_zeta - gamma_claim / k_size);
 
