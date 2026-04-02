@@ -149,7 +149,7 @@ mod marlin {
                 num_variables,
             };
 
-            let (index_pk, index_vk) = MarlinInst::index(&universal_srs, circ.clone()).unwrap();
+            let (index_pk, index_vk) = MarlinInst::index(&universal_srs, circ.clone(), 0).unwrap();
             println!("Called index");
 
             let proof = MarlinInst::prove(&index_pk, circ, rng).unwrap();
@@ -213,7 +213,7 @@ mod marlin {
             field_phantom: PhantomData,
         };
 
-        let (index_pk, index_vk) = MarlinInst::index(&universal_srs, circ.clone()).unwrap();
+        let (index_pk, index_vk) = MarlinInst::index(&universal_srs, circ.clone(), 0).unwrap();
         println!("Called index");
 
         let proof = MarlinInst::prove(&index_pk, circ, rng).unwrap();

@@ -35,8 +35,11 @@ pub struct IndexInfo<F> {
     pub num_constraints: usize,
     /// The total number of non-zero entries in the sum of all constraint matrices.
     pub num_non_zero: usize,
-    /// The number of input elements.
+    /// The number of input elements (including the leading 1).
     pub num_instance_variables: usize,
+    /// The number of public output elements (last `s` witness variables by convention).
+    /// H layout is (x, w_internal, y): x first, y last, w_internal in the middle.
+    pub num_output_variables: usize,
 
     #[doc(hidden)]
     f: PhantomData<F>,
@@ -49,12 +52,14 @@ impl<F> IndexInfo<F> {
         num_constraints: usize,
         num_non_zero: usize,
         num_instance_variables: usize,
+        num_output_variables: usize,
     ) -> Self {
         Self {
             num_variables,
             num_constraints,
             num_non_zero,
             num_instance_variables,
+            num_output_variables,
             f: PhantomData,
         }
     }
@@ -64,7 +69,8 @@ impl<F: PrimeField> ark_ff::ToBytes for IndexInfo<F> {
     fn write<W: Write>(&self, mut w: W) -> ark_std::io::Result<()> {
         (self.num_variables as u64).write(&mut w)?;
         (self.num_constraints as u64).write(&mut w)?;
-        (self.num_non_zero as u64).write(&mut w)
+        (self.num_non_zero as u64).write(&mut w)?;
+        (self.num_output_variables as u64).write(&mut w)
     }
 }
 
@@ -148,7 +154,12 @@ impl<F: PrimeField> Index<F> {
 
 impl<F: PrimeField> AHPForR1CS<F> {
     /// Generate the index for this constraint system.
-    pub fn index<C: ConstraintSynthesizer<F>>(c: C) -> Result<Index<F>, Error> {
+    /// `num_output_variables` is the number of public outputs: the last `s` witness variables
+    /// by convention, occupying the last `s` positions of H.
+    pub fn index<C: ConstraintSynthesizer<F>>(
+        c: C,
+        num_output_variables: usize,
+    ) -> Result<Index<F>, Error> {
         let index_time = start_timer!(|| "AHP::Index");
 
         let constraint_time = start_timer!(|| "Generating constraints");
@@ -198,7 +209,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
             num_constraints,
             num_non_zero,
             num_instance_variables: num_formatted_input_variables,
-
+            num_output_variables,
             f: PhantomData,
         };
 

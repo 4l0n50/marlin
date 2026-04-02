@@ -19,6 +19,9 @@ pub struct VerifierState<F: PrimeField> {
 
     /// gamma_claim: the inner sum γ = Φ(α,β) sent by the prover in round 3
     pub(crate) gamma_claim: Option<F>,
+
+    /// Number of public output variables (last s witness variables by convention).
+    pub(crate) num_output_variables: usize,
 }
 
 /// Third verifier message.
@@ -31,6 +34,8 @@ pub struct VerifierThirdMsg<F> {
 /// First message of the verifier.
 #[derive(Copy, Clone)]
 pub struct VerifierFirstMsg<F> {
+    /// Randomizer for the t(X) - Φ(α,X) zero-check.
+    pub eta: F,
     /// Query for the random polynomial.
     pub alpha: F,
     /// Randomizer for the lincheck for `A`.
@@ -54,6 +59,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         index_info: IndexInfo<F>,
         rng: &mut R,
     ) -> Result<(VerifierFirstMsg<F>, VerifierState<F>), Error> {
+        let num_output_variables = index_info.num_output_variables;
         if index_info.num_constraints != index_info.num_variables {
             return Err(Error::NonSquareMatrix);
         }
@@ -64,12 +70,14 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let domain_k = GeneralEvaluationDomain::new(index_info.num_non_zero)
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
 
+        let eta = F::rand(rng);
         let alpha = domain_h.sample_element_outside_domain(rng);
         let eta_a = F::rand(rng);
         let eta_b = F::rand(rng);
         let eta_c = F::rand(rng);
 
         let msg = VerifierFirstMsg {
+            eta,
             alpha,
             eta_a,
             eta_b,
@@ -83,6 +91,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
             second_round_msg: None,
             third_round_msg: None,
             gamma_claim: None,
+            num_output_variables,
         };
 
         Ok((msg, new_state))
@@ -154,6 +163,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         query_set.insert(("g_1".into(), ("beta".into(), beta)));
         query_set.insert(("z_b".into(), ("beta".into(), beta)));
         query_set.insert(("z_c".into(), ("beta".into(), beta)));
+        query_set.insert(("y".into(), ("beta".into(), beta)));
         query_set.insert(("t".into(), ("beta".into(), beta)));
         query_set.insert(("outer_sumcheck".into(), ("beta".into(), beta)));
 

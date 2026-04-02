@@ -37,9 +37,9 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
     /// The labels for the polynomials output by the AHP prover.
     #[rustfmt::skip]
-    pub const PROVER_POLYNOMIALS: [&'static str; 12] = [
+    pub const PROVER_POLYNOMIALS: [&'static str; 13] = [
         // First round
-        "w", "z_a", "z_b", "z_c", "s_1", "s_2",
+        "w", "z_a", "z_b", "z_c", "y", "s_1", "s_2",
         // Second round
         "t", "g_1", "h_1",
         // Third round
@@ -90,7 +90,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
             domain_k_size + 1, // s_2
             domain_h_size,
             domain_h_size,
-            domain_k_size,     // f (blinded with v_K, degree |K|)
+            domain_k_size, // f (blinded with v_K, degree |K|)
             domain_k_size - 1,
         ]
         .iter()
@@ -133,6 +133,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
 
         let first_round_msg = state.first_round_msg.unwrap();
+        let eta = first_round_msg.eta;
         let alpha = first_round_msg.alpha;
         let eta_a = first_round_msg.eta_a;
         let eta_b = first_round_msg.eta_b;
@@ -140,7 +141,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         let beta = state.second_round_msg.unwrap().beta;
         let zeta = state.third_round_msg.unwrap().zeta;
-        // γ = Φ(α,β) = t(β): sent by the prover as the round-3 message
+        // γ = Φ(α,β): sent by the prover as the round-3 message.
         let gamma_claim = state.gamma_claim.unwrap();
 
         let mut linear_combinations = Vec::new();
@@ -155,9 +156,17 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let v_H_at_beta = domain_h.evaluate_vanishing_polynomial(beta);
         let v_X_at_beta = x_domain.evaluate_vanishing_polynomial(beta);
 
+        // v_Y(β): vanishing polynomial over the last s elements of H, evaluated at β.
+        // s = num_output_variables; last s elements of H are h_{n-s},...,h_{n-1}.
+        let s = state.num_output_variables;
+        let h_elems: Vec<F> = domain_h.elements().collect();
+        let n = domain_h.size();
+        let v_Y_at_beta: F = h_elems[n - s..].iter().map(|&h| beta - h).product();
+
         let z_c = LinearCombination::new("z_c", vec![(F::one(), "z_c")]);
+        let y_lc = LinearCombination::new("y", vec![(F::one(), "y")]);
         let z_b_at_beta = evals.get_lc_eval(&z_b, beta)?;
-        let z_c_at_beta = evals.get_lc_eval(&z_c, beta)?;
+        let y_at_beta = evals.get_lc_eval(&y_lc, beta)?;
         let t_at_beta = evals.get_lc_eval(&t, beta)?;
         let g_1_at_beta = evals.get_lc_eval(&g_1, beta)?;
 
@@ -177,8 +186,10 @@ impl<F: PrimeField> AHPForR1CS<F> {
                 (r_alpha_at_beta * eta_a, "z_a".into()),
                 (r_alpha_at_beta * eta_b * z_b_at_beta, LCTerm::One),
 
-                (-t_at_beta * v_X_at_beta, "w".into()),
+                // -t(β)·ẑ(β) where ẑ(β) = w(β)·v_X(β)·v_Y(β) + x̂(β) + ŷ(β)
+                (-t_at_beta * v_X_at_beta * v_Y_at_beta, "w".into()),
                 (-t_at_beta * x_at_beta, LCTerm::One),
+                (-t_at_beta * y_at_beta, LCTerm::One),
 
                 (-v_H_at_beta, "h_1".into()),
                 (-beta * g_1_at_beta, LCTerm::One),
@@ -186,12 +197,17 @@ impl<F: PrimeField> AHPForR1CS<F> {
                 // η_C·(z_A(β)·z_B(β) - z_C(β)) zero-check term
                 (eta_c * z_b_at_beta, "z_a".into()),
                 (-eta_c, "z_c".into()),
+
+                // η·(t(β) - γ) zero-check term: t = Φ(α,·) + ρ_t·v_H, so t - Φ(α,·) vanishes on H
+                (eta, "t".into()),
+                (-eta * gamma_claim, LCTerm::One),
             ],
         );
         debug_assert!(evals.get_lc_eval(&outer_sumcheck, beta)?.is_zero());
 
         linear_combinations.push(z_b);
         linear_combinations.push(z_c);
+        linear_combinations.push(y_lc);
         linear_combinations.push(g_1);
         linear_combinations.push(t);
         linear_combinations.push(outer_sumcheck);
@@ -210,10 +226,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let v_K_at_zeta = domain_k.evaluate_vanishing_polynomial(zeta);
 
         // a(ζ) = v_H(α)·v_H(β)·(η_A·a_val(ζ) + η_B·b_val(ζ))  — C excluded from inner sumcheck
-        let mut a = LinearCombination::new(
-            "a_poly",
-            vec![(eta_a, "a_val"), (eta_b, "b_val")],
-        );
+        let mut a = LinearCombination::new("a_poly", vec![(eta_a, "a_val"), (eta_b, "b_val")]);
         a *= v_H_at_alpha * v_H_at_beta;
 
         // b(ζ) = (αβ - α·row(ζ) - β·col(ζ) + rowcol(ζ))
@@ -230,14 +243,14 @@ impl<F: PrimeField> AHPForR1CS<F> {
         b *= f_at_zeta;
 
         // ζ-correction: ζ·(s_2(ζ)·v_H(β) + f(ζ) - ζ·g_2(ζ) - γ/|K|)
-        let zeta_correction = zeta * (s_2_at_zeta * v_H_at_beta + f_at_zeta
-            - zeta * g_2_at_zeta
-            - gamma_claim / k_size);
+        let zeta_correction = zeta
+            * (s_2_at_zeta * v_H_at_beta + f_at_zeta - zeta * g_2_at_zeta - gamma_claim / k_size);
 
         let mut inner_sumcheck = a;
         inner_sumcheck -= &b;
         inner_sumcheck -= &LinearCombination::new("h_2", vec![(v_K_at_zeta, "h_2")]);
-        inner_sumcheck += &LinearCombination::new("zeta_correction", vec![(zeta_correction, LCTerm::One)]);
+        inner_sumcheck +=
+            &LinearCombination::new("zeta_correction", vec![(zeta_correction, LCTerm::One)]);
 
         inner_sumcheck.label = "inner_sumcheck".into();
         debug_assert!(evals.get_lc_eval(&inner_sumcheck, zeta)?.is_zero());
