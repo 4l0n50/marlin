@@ -39,12 +39,13 @@ pub struct ProverState<'a, F: PrimeField> {
     w_poly: Option<LabeledPolynomial<F>>,
     mz_polys: Option<(LabeledPolynomial<F>, LabeledPolynomial<F>)>,
     z_c_poly: Option<LabeledPolynomial<F>>,
-    /// y_poly: LDE of public output (0,...,0,y) over H (not committed; verifier computes y(β) directly)
+    /// y_poly: LDE of the public output values over their output positions in H
+    /// (not committed; verifier computes y(β) directly)
     y_poly: Option<DensePolynomial<F>>,
     /// Public output values (last s witness variables); stored so the prover-side
-    /// construct_linear_combinations call can compute ŷ(β) without a commitment.
+    /// output embedding can be reconstructed consistently in later rounds.
     pub output_assignment: Vec<F>,
-    /// v_Y_poly: vanishing polynomial over the last s elements of H
+    /// v_Y_poly: vanishing polynomial over the output positions in H
     v_Y_poly: Option<DensePolynomial<F>>,
 
     index: &'a Index<F>,
@@ -390,19 +391,33 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let n = domain_h.size();
         let ratio = n / domain_x.size();
         let h_elems: Vec<F> = domain_h.elements().collect();
-        let x_poly = EvaluationsOnDomain::from_vec_and_domain(
-            state.formatted_input_assignment.clone(),
-            domain_x,
-        )
-        .interpolate();
-        let x_evals = domain_h.fft(&x_poly);
+        let (_x_poly, mut x_evals) = if s > 0 {
+            let mut x_evals = vec![F::zero(); n];
+            for (i, x_i) in state.formatted_input_assignment.iter().enumerate() {
+                let idx = domain_h.reindex_by_subdomain(domain_x, i);
+                x_evals[idx] = *x_i;
+            }
+            let x_poly =
+                EvaluationsOnDomain::from_vec_and_domain(x_evals.clone(), domain_h).interpolate();
+            (x_poly, x_evals)
+        } else {
+            let x_poly = EvaluationsOnDomain::from_vec_and_domain(
+                state.formatted_input_assignment.clone(),
+                domain_x,
+            )
+            .interpolate();
+            let x_evals = domain_h.fft(&x_poly);
+            (x_poly, x_evals)
+        };
         end_timer!(x_time);
 
-        // Output positions in H: the last s witness variables occupy the last s
-        // positions among the witness slots in H (i.e. {k : k % ratio != 0}).
+        // Output positions in H: the last s actual witness variables occupy the last s
+        // interleaved witness slots used by the witness assignment. Any remaining
+        // witness slots in H come from domain padding and are not real variables.
         let witness_h_positions: Vec<usize> = (0..n).filter(|k| k % ratio != 0).collect();
+        let used_witness_h_positions = &witness_h_positions[..state.witness_assignment.len()];
         let output_h_positions: Vec<usize> = if s > 0 {
-            witness_h_positions[witness_h_positions.len() - s..].to_vec()
+            used_witness_h_positions[used_witness_h_positions.len() - s..].to_vec()
         } else {
             vec![]
         };
@@ -430,38 +445,49 @@ impl<F: PrimeField> AHPForR1CS<F> {
             vec![F::zero(); s]
         };
 
-        // y_poly: LDE of (0,...,0, y_0,...,y_{s-1}) over H, blinded by r_y·v_H
-        // Evaluated as: 0 at first n-s positions, y_i at last s positions.
+        // y_poly: the low-degree polynomial interpolating the public outputs over
+        // their output positions in H.
         let y_poly_time = start_timer!(|| "Computing y polynomial");
-        let mut y_evals_on_h = vec![F::zero(); n];
-        for (i, &val) in y_vals.iter().enumerate() {
-            y_evals_on_h[n - s + i] = val;
-        }
-        let y_poly = EvaluationsOnDomain::from_vec_and_domain(y_evals_on_h, domain_h).interpolate();
+        let y_poly = {
+            let mut acc = DensePolynomial::zero();
+            for (i, (&h_i, &y_i)) in output_h_roots.iter().zip(&y_vals).enumerate() {
+                let mut numer = DensePolynomial::from_coefficients_slice(&[F::one()]);
+                let mut denom = F::one();
+                for (j, &h_j) in output_h_roots.iter().enumerate() {
+                    if i != j {
+                        numer = &numer
+                            * &DensePolynomial::from_coefficients_slice(&[-h_j, F::one()]);
+                        denom *= h_i - h_j;
+                    }
+                }
+                acc += &(&numer * (y_i / denom));
+            }
+            acc
+        };
+        let y_evals_on_h = y_poly.evaluate_over_domain_by_ref(domain_h).evals;
         end_timer!(y_poly_time);
+
+        if s > 0 {
+            for i in 0..state.formatted_input_assignment.len() {
+                let idx = domain_h.reindex_by_subdomain(domain_x, i);
+                x_evals[idx] -= y_evals_on_h[idx];
+            }
+        }
 
         // ẑ(X) = ŵ(X)·v_X(X)·v_Y(X) + x̂(X) + ŷ(X)
         // => ŵ(X) = (ẑ(X) - x̂(X) - ŷ(X)) / (v_X(X)·v_Y(X))
-        // w_poly_evals: at x positions (k % ratio == 0): 0 - x_evals[k] - 0 (but x already covers)
-        // at y positions (last s): 0 - 0 - y_evals (covered by y_poly)
-        // at middle positions: witness values - x_evals[k] (x_evals is 0 there)
-
-        let mut w_extended = witness.clone();
-        // Trim the y values from w_extended (they are handled by y_poly)
-        let w_internal_len = num_witness.saturating_sub(num_output);
-        w_extended.truncate(w_internal_len);
-        w_extended.extend(vec![F::zero(); n - domain_x.size() - w_internal_len]);
+        let mut z_evals_on_h = vec![F::zero(); n];
+        for (i, x_i) in state.formatted_input_assignment.iter().enumerate() {
+            let idx = domain_h.reindex_by_subdomain(domain_x, i);
+            z_evals_on_h[idx] = *x_i;
+        }
+        for (&idx, &w_i) in used_witness_h_positions.iter().zip(witness.iter()) {
+            z_evals_on_h[idx] = w_i;
+        }
 
         let w_poly_time = start_timer!(|| "Computing w polynomial");
         let w_poly_evals: Vec<F> = cfg_into_iter!(0..n)
-            .map(|k| {
-                if k % ratio == 0 || k >= n - s {
-                    // x or y position: ŵ is zero here
-                    F::zero()
-                } else {
-                    w_extended[k - (k / ratio) - 1] - x_evals[k]
-                }
-            })
+            .map(|k| z_evals_on_h[k] - x_evals[k] - y_evals_on_h[k])
             .collect();
 
         let w_poly_blinded = &EvaluationsOnDomain::from_vec_and_domain(w_poly_evals, domain_h)
@@ -682,14 +708,24 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let domain_x = GeneralEvaluationDomain::new(state.formatted_input_assignment.len())
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)
             .unwrap();
-        let x_poly = EvaluationsOnDomain::from_vec_and_domain(
-            state.formatted_input_assignment.clone(),
-            domain_x,
-        )
-        .interpolate();
+        let y_poly = state.y_poly.as_ref().unwrap();
+        let x_poly = if state.index.index_info.num_output_variables > 0 {
+            let mut x_evals_on_h = vec![F::zero(); domain_h.size()];
+            let h_elems: Vec<F> = domain_h.elements().collect();
+            for (i, x_i) in state.formatted_input_assignment.iter().enumerate() {
+                let idx = domain_h.reindex_by_subdomain(domain_x, i);
+                x_evals_on_h[idx] = *x_i - y_poly.evaluate(&h_elems[idx]);
+            }
+            EvaluationsOnDomain::from_vec_and_domain(x_evals_on_h, domain_h).interpolate()
+        } else {
+            EvaluationsOnDomain::from_vec_and_domain(
+                state.formatted_input_assignment.clone(),
+                domain_x,
+            )
+            .interpolate()
+        };
         let w_poly = state.w_poly.as_ref().unwrap();
         let v_Y_poly = state.v_Y_poly.as_ref().unwrap().clone();
-        let y_poly = state.y_poly.as_ref().unwrap();
         // ẑ(X) = ŵ(X)·v_X(X)·v_Y(X) + x̂(X) + ŷ(X)
         let v_X_poly: DensePolynomial<F> = domain_x.vanishing_polynomial().into();
         let z_poly = &(&(w_poly.polynomial() * &v_X_poly) * &v_Y_poly) + &(&x_poly + y_poly);
@@ -718,6 +754,28 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let t_poly_m_evals = t_poly.evaluate_over_domain_by_ref(mul_domain);
         let z_a_z_b_evals = z_a_times_z_b.evaluate_over_domain_by_ref(mul_domain);
         let z_c_evals_mul = z_c_poly.evaluate_over_domain_by_ref(mul_domain);
+
+        let lin_term_poly = {
+            let mut evals = r_alpha_poly.evaluate_over_domain_by_ref(mul_domain);
+            cfg_iter_mut!(evals.evals)
+                .zip(&summed_z_m_evals.evals)
+                .for_each(|(r_a, z_m)| *r_a *= z_m);
+            evals.interpolate()
+        };
+        let tz_term_poly = {
+            let mut evals = t_poly.evaluate_over_domain_by_ref(mul_domain);
+            cfg_iter_mut!(evals.evals)
+                .zip(&z_poly_evals.evals)
+                .for_each(|(t, z)| *t *= z);
+            -evals.interpolate()
+        };
+        let mul_term_poly = {
+            let mut evals = z_a_times_z_b.evaluate_over_domain_by_ref(mul_domain);
+            cfg_iter_mut!(evals.evals)
+                .zip(&z_c_evals_mul.evals)
+                .for_each(|(zab, zc)| *zab = eta_c * (*zab - zc));
+            evals.interpolate()
+        };
 
         cfg_iter_mut!(r_alpha_evals.evals)
             .zip(&summed_z_m_evals.evals)

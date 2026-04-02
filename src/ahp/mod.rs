@@ -191,8 +191,9 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let v_X_at_beta = x_domain.evaluate_vanishing_polynomial(beta);
 
         // v_Y(β): vanishing polynomial over the s output H positions, evaluated at β.
-        // Outputs are the last s witness variables, which occupy the last s positions
-        // among {k ∈ 0..n : k % ratio != 0} (the witness slots in H).
+        // Outputs are the last s actual witness variables, which occupy the last s
+        // interleaved witness slots used by the witness assignment. Any remaining
+        // witness slots in H come only from domain padding.
         let s = state.num_output_variables;
         let h_elems: Vec<F> = domain_h.elements().collect();
         let n = domain_h.size();
@@ -200,8 +201,10 @@ impl<F: PrimeField> AHPForR1CS<F> {
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
         let ratio = n / x_domain.size();
         let witness_h_positions: Vec<usize> = (0..n).filter(|k| k % ratio != 0).collect();
+        let num_witness_variables = state.num_variables - state.num_instance_variables;
+        let used_witness_h_positions = &witness_h_positions[..num_witness_variables];
         let output_h_positions: Vec<usize> = if s > 0 {
-            witness_h_positions[witness_h_positions.len() - s..].to_vec()
+            used_witness_h_positions[used_witness_h_positions.len() - s..].to_vec()
         } else {
             vec![]
         };
@@ -212,6 +215,8 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let z_b_at_beta = evals.get_lc_eval(&z_b, beta)?;
         // ŷ(β): computed directly from public output values via Lagrange interpolation
         // over the s output positions of H — no commitment needed.
+        let public_input_len = public_input.len();
+        let public_output_len = public_output.len();
         let y_at_beta: F = output_h_roots
             .iter()
             .zip(public_output)
@@ -224,17 +229,44 @@ impl<F: PrimeField> AHPForR1CS<F> {
                 y_i * lagrange_i
             })
             .sum();
+        let y_at_input_roots: Vec<F> = (0..state.num_instance_variables)
+            .map(|i| {
+                let x_root = h_elems[domain_h.reindex_by_subdomain(x_domain, i)];
+                output_h_roots
+                    .iter()
+                    .zip(public_output.iter())
+                    .map(|(&h_i, &y_i)| {
+                        let lagrange_i: F = output_h_roots
+                            .iter()
+                            .filter(|&&h_j| h_j != h_i)
+                            .map(|&h_j| (x_root - h_j) / (h_i - h_j))
+                            .product();
+                        y_i * lagrange_i
+                    })
+                    .sum()
+            })
+            .collect();
         let t_at_beta = evals.get_lc_eval(&t, beta)?;
         let g_1_at_beta = evals.get_lc_eval(&g_1, beta)?;
 
-        // x̂(β): evaluation of the public input polynomial at β, computed directly
-        // from the public input values via Lagrange interpolation (no commitment needed).
-        let x_at_beta = x_domain
-            .evaluate_all_lagrange_coefficients(beta)
-            .into_iter()
-            .zip(public_input)
-            .map(|(l, x)| l * &x)
-            .fold(F::zero(), |x, y| x + &y);
+        // x̂(β): evaluation of the public input polynomial. With public outputs enabled,
+        // x is embedded over the input slots of H so that it vanishes on output slots.
+        let x_at_beta = if s > 0 {
+            let lagrange_on_h = domain_h.evaluate_all_lagrange_coefficients(beta);
+            (0..state.num_instance_variables)
+                .map(|i| {
+                    let idx = domain_h.reindex_by_subdomain(x_domain, i);
+                    lagrange_on_h[idx] * (public_input[i] - y_at_input_roots[i])
+                })
+                .sum()
+        } else {
+            x_domain
+                .evaluate_all_lagrange_coefficients(beta)
+                .into_iter()
+                .zip(public_input.iter())
+                .map(|(l, x)| l * x)
+                .fold(F::zero(), |x, y| x + &y)
+        };
 
         #[rustfmt::skip]
         let outer_sumcheck = LinearCombination::new(
