@@ -22,6 +22,10 @@ pub struct VerifierState<F: PrimeField> {
 
     /// Number of public output variables (last s witness variables by convention).
     pub(crate) num_output_variables: usize,
+    /// Total number of variables (= num_constraints after squaring).
+    pub(crate) num_variables: usize,
+    /// Number of formatted public input variables (size of domain X).
+    pub(crate) num_instance_variables: usize,
 }
 
 /// Third verifier message.
@@ -92,6 +96,8 @@ impl<F: PrimeField> AHPForR1CS<F> {
             third_round_msg: None,
             gamma_claim: None,
             num_output_variables,
+            num_variables: index_info.num_variables,
+            num_instance_variables: index_info.num_instance_variables,
         };
 
         Ok((msg, new_state))

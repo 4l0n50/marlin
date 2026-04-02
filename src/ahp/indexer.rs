@@ -16,11 +16,13 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError
 use ark_std::{
     io::{Read, Write},
     marker::PhantomData,
+    rand::RngCore,
 };
 use derivative::Derivative;
 
 use crate::ahp::constraint_systems::{
     make_matrices_square_for_indexer, num_non_zero, pad_input_for_indexer_and_prover,
+    IndexerRandomness,
 };
 
 /// Information about the index, including the field of definition, the number of
@@ -152,9 +154,10 @@ impl<F: PrimeField> AHPForR1CS<F> {
     /// Generate the index for this constraint system.
     /// `num_output_variables` is the number of public outputs: the last `s` witness variables
     /// by convention, occupying the last `s` positions of H.
-    pub fn index<C: ConstraintSynthesizer<F>>(
+    pub fn index<C: ConstraintSynthesizer<F>, R: RngCore>(
         c: C,
         num_output_variables: usize,
+        rng: &mut R,
     ) -> Result<Index<F>, Error> {
         let index_time = start_timer!(|| "AHP::Index");
 
@@ -217,6 +220,13 @@ impl<F: PrimeField> AHPForR1CS<F> {
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
 
         let joint_arithmetization_time = start_timer!(|| "Arithmetizing all matrices");
+        let rnd = IndexerRandomness {
+            r_row:     F::rand(rng),
+            r_col:     F::rand(rng),
+            r_val_a:   F::rand(rng),
+            r_val_b:   F::rand(rng),
+            r_row_col: F::rand(rng),
+        };
         let joint_arith = arithmetize_matrix(
             &joint_matrix,
             &a,
@@ -224,6 +234,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
             domain_k,
             domain_h,
             x_domain,
+            &rnd,
         );
         end_timer!(joint_arithmetization_time);
 

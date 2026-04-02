@@ -385,6 +385,11 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         let x_time = start_timer!(|| "Computing x polynomial and evals");
         let domain_x = state.domain_x;
+        let num_output = state.index.index_info.num_output_variables;
+        let s = num_output;
+        let n = domain_h.size();
+        let ratio = n / domain_x.size();
+        let h_elems: Vec<F> = domain_h.elements().collect();
         let x_poly = EvaluationsOnDomain::from_vec_and_domain(
             state.formatted_input_assignment.clone(),
             domain_x,
@@ -393,19 +398,19 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let x_evals = domain_h.fft(&x_poly);
         end_timer!(x_time);
 
-        // domain_y: the subdomain of H corresponding to the last s elements (public output y).
-        // H layout: (x, w_internal, y) — x occupies the first |domain_x| positions,
-        // y occupies the last s positions, w_internal fills the middle.
-        let num_output = state.index.index_info.num_output_variables;
-        let n = domain_h.size();
-        // s: actual number of output elements (not rounded up to power of 2)
-        let s = num_output;
-        let h_elems: Vec<F> = domain_h.elements().collect();
+        // Output positions in H: the last s witness variables occupy the last s
+        // positions among the witness slots in H (i.e. {k : k % ratio != 0}).
+        let witness_h_positions: Vec<usize> = (0..n).filter(|k| k % ratio != 0).collect();
+        let output_h_positions: Vec<usize> = if s > 0 {
+            witness_h_positions[witness_h_positions.len() - s..].to_vec()
+        } else {
+            vec![]
+        };
+        let output_h_roots: Vec<F> = output_h_positions.iter().map(|&k| h_elems[k]).collect();
+
         let v_Y_poly: DensePolynomial<F> = {
-            let last_s: Vec<F> = h_elems[n - s..].to_vec();
             let mut coeffs = vec![F::one()];
-            for root in last_s {
-                // multiply (coeffs) by (X - root)
+            for &root in &output_h_roots {
                 let mut new_coeffs = vec![F::zero(); coeffs.len() + 1];
                 for (i, c) in coeffs.iter().enumerate() {
                     new_coeffs[i + 1] += c;
@@ -419,8 +424,8 @@ impl<F: PrimeField> AHPForR1CS<F> {
         // y values: last s entries of witness_assignment
         let witness = &state.witness_assignment;
         let num_witness = witness.len();
-        let y_vals: Vec<F> = if num_output > 0 && num_witness >= num_output {
-            witness[num_witness - num_output..].to_vec()
+        let y_vals: Vec<F> = if s > 0 && num_witness >= s {
+            witness[num_witness - s..].to_vec()
         } else {
             vec![F::zero(); s]
         };
@@ -440,16 +445,12 @@ impl<F: PrimeField> AHPForR1CS<F> {
         // w_poly_evals: at x positions (k % ratio == 0): 0 - x_evals[k] - 0 (but x already covers)
         // at y positions (last s): 0 - 0 - y_evals (covered by y_poly)
         // at middle positions: witness values - x_evals[k] (x_evals is 0 there)
-        let ratio = domain_h.size() / domain_x.size();
 
         let mut w_extended = witness.clone();
         // Trim the y values from w_extended (they are handled by y_poly)
         let w_internal_len = num_witness.saturating_sub(num_output);
         w_extended.truncate(w_internal_len);
-        w_extended.extend(vec![
-            F::zero();
-            n - domain_x.size() - w_internal_len
-        ]);
+        w_extended.extend(vec![F::zero(); n - domain_x.size() - w_internal_len]);
 
         let w_poly_time = start_timer!(|| "Computing w polynomial");
         let w_poly_evals: Vec<F> = cfg_into_iter!(0..n)
@@ -468,14 +469,18 @@ impl<F: PrimeField> AHPForR1CS<F> {
             + &(&DensePolynomial::from_coefficients_slice(&[F::rand(rng)]) * &v_H);
         use ark_poly::univariate::DenseOrSparsePolynomial;
         // Divide by v_X first (using the fast domain method), then by v_Y
-        let (w_poly_div_vx, remainder_vx) = w_poly_blinded.divide_by_vanishing_poly(domain_x).unwrap();
+        let (w_poly_div_vx, remainder_vx) =
+            w_poly_blinded.divide_by_vanishing_poly(domain_x).unwrap();
         assert!(remainder_vx.is_zero());
         let (w_poly, remainder) = if s > 0 {
             DenseOrSparsePolynomial::from(w_poly_div_vx)
                 .divide_with_q_and_r(&DenseOrSparsePolynomial::from(v_Y_poly.clone()))
                 .unwrap()
         } else {
-            (w_poly_div_vx, DensePolynomial::from_coefficients_vec(vec![]))
+            (
+                w_poly_div_vx,
+                DensePolynomial::from_coefficients_vec(vec![]),
+            )
         };
         assert!(remainder.is_zero());
         end_timer!(w_poly_time);
@@ -689,7 +694,6 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let v_X_poly: DensePolynomial<F> = domain_x.vanishing_polynomial().into();
         let z_poly = &(&(w_poly.polynomial() * &v_X_poly) * &v_Y_poly) + &(&x_poly + y_poly);
         assert!(z_poly.degree() < domain_h.size() + zk_bound);
-
         end_timer!(z_poly_time);
 
         let q_1_time = start_timer!(|| "Compute q_1 poly");
@@ -954,20 +958,32 @@ impl<F: PrimeField> AHPForR1CS<F> {
         };
         end_timer!(a_poly_time);
 
-        let (row_on_K, col_on_K, row_col_on_K) = (
-            &joint_arith.evals_on_K.row,
-            &joint_arith.evals_on_K.col,
-            &joint_arith.evals_on_K.row_col,
-        );
         let b_poly_time = start_timer!(|| "Computing b poly");
         let alpha_beta = alpha * beta;
+        // b(X) = αβ - α·row(X) - β·col(X) + row_col(X)
+        // Use the blinded polynomials directly so the verifier's LC (which also
+        // evaluates the blinded committed polynomials) is consistent.
         let b_poly = {
-            let evals: Vec<F> = cfg_iter!(row_on_K.evals)
-                .zip(&col_on_K.evals)
-                .zip(&row_col_on_K.evals)
-                .map(|((r, c), r_c)| alpha_beta - alpha * r - beta * c + r_c)
-                .collect();
-            EvaluationsOnDomain::from_vec_and_domain(evals, domain_k).interpolate()
+            let row_coeffs = joint_arith.row.coeffs();
+            let col_coeffs = joint_arith.col.coeffs();
+            let row_col_coeffs = joint_arith.row_col.coeffs();
+            let len = row_coeffs
+                .len()
+                .max(col_coeffs.len())
+                .max(row_col_coeffs.len())
+                + 1;
+            let mut coeffs = vec![F::zero(); len];
+            coeffs[0] += alpha_beta;
+            for (i, &r) in row_coeffs.iter().enumerate() {
+                coeffs[i] -= alpha * r;
+            }
+            for (i, &c) in col_coeffs.iter().enumerate() {
+                coeffs[i] -= beta * c;
+            }
+            for (i, &rc) in row_col_coeffs.iter().enumerate() {
+                coeffs[i] += rc;
+            }
+            DensePolynomial::from_coefficients_vec(coeffs)
         };
         end_timer!(b_poly_time);
 

@@ -4,7 +4,10 @@ use crate::ahp::indexer::Matrix;
 use crate::ahp::*;
 use crate::BTreeMap;
 use ark_ff::{Field, PrimeField};
-use ark_poly::{EvaluationDomain, Evaluations as EvaluationsOnDomain, GeneralEvaluationDomain};
+use ark_poly::{
+    univariate::DensePolynomial, EvaluationDomain, Evaluations as EvaluationsOnDomain,
+    GeneralEvaluationDomain, UVPolynomial,
+};
 use ark_relations::{lc, r1cs::ConstraintSystemRef};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
 use ark_std::{
@@ -118,6 +121,17 @@ pub struct MatrixArithmetization<F: PrimeField> {
     pub evals_on_K: MatrixEvals<F>,
 }
 
+/// Randomness for blinding the index polynomials.
+/// Each field element blinds one polynomial by adding `r · z_K(X)`.
+/// Order: (r_row, r_col, r_val_a, r_val_b, r_row_col).
+pub(crate) struct IndexerRandomness<F: PrimeField> {
+    pub r_row: F,
+    pub r_col: F,
+    pub r_val_a: F,
+    pub r_val_b: F,
+    pub r_row_col: F,
+}
+
 pub(crate) fn arithmetize_matrix<F: PrimeField>(
     joint_matrix: &Vec<Vec<usize>>,
     a: &Matrix<F>,
@@ -125,6 +139,7 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
     interpolation_domain: GeneralEvaluationDomain<F>,
     output_domain: GeneralEvaluationDomain<F>,
     input_domain: GeneralEvaluationDomain<F>,
+    rnd: &IndexerRandomness<F>,
 ) -> MatrixArithmetization<F> {
     let matrix_time = start_timer!(|| "Computing row, col, and val LDEs");
 
@@ -229,6 +244,15 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
         val_b: val_b_evals_on_K,
     };
 
+    // Blind each index polynomial with r · z_K(X).
+    // z_K vanishes on K, so evals_on_K are unaffected.
+    let z_K: DensePolynomial<F> = interpolation_domain.vanishing_polynomial().into();
+    let row     = row     + &DensePolynomial::from_coefficients_slice(&[rnd.r_row])     * &z_K;
+    let col     = col     + &DensePolynomial::from_coefficients_slice(&[rnd.r_col])     * &z_K;
+    let val_a   = val_a   + &DensePolynomial::from_coefficients_slice(&[rnd.r_val_a])   * &z_K;
+    let val_b   = val_b   + &DensePolynomial::from_coefficients_slice(&[rnd.r_val_b])   * &z_K;
+    let row_col = row_col + &DensePolynomial::from_coefficients_slice(&[rnd.r_row_col]) * &z_K;
+
     MatrixArithmetization {
         row: LabeledPolynomial::new("row".into(), row, None, None),
         col: LabeledPolynomial::new("col".into(), col, None, None),
@@ -323,6 +347,14 @@ mod tests {
         let interpolation_domain = EvaluationDomain::new(num_non_zero).unwrap();
         let output_domain = EvaluationDomain::new(2 + 6).unwrap();
         let input_domain = EvaluationDomain::new(2).unwrap();
+        let mut rng = ark_std::test_rng();
+        let rnd = IndexerRandomness {
+            r_row:     F::rand(&mut rng),
+            r_col:     F::rand(&mut rng),
+            r_val_a:   F::rand(&mut rng),
+            r_val_b:   F::rand(&mut rng),
+            r_row_col: F::rand(&mut rng),
+        };
         let joint_arith = arithmetize_matrix(
             &joint_matrix,
             &a,
@@ -330,6 +362,7 @@ mod tests {
             interpolation_domain,
             output_domain,
             input_domain,
+            &rnd,
         );
         let inverse_map = output_domain
             .elements()
@@ -349,7 +382,6 @@ mod tests {
             .zip(output_domain.batch_eval_unnormalized_bivariate_lagrange_poly_with_same_inputs())
             .collect();
 
-        let mut rng = ark_std::test_rng();
         let eta_a = F::rand(&mut rng);
         let eta_b = F::rand(&mut rng);
         for (k_index, k) in interpolation_domain.elements().enumerate() {

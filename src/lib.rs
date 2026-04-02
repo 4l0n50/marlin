@@ -98,15 +98,16 @@ impl<F: PrimeField, PC: PolynomialCommitment<F, DensePolynomial<F>>, FS: FiatSha
     /// Generate the index-specific (i.e., circuit-specific) prover and verifier
     /// keys. This is a deterministic algorithm that anyone can rerun.
     /// `num_output_variables` is the number of public outputs (last `s` witness variables).
-    pub fn index<C: ConstraintSynthesizer<F>>(
+    pub fn index<C: ConstraintSynthesizer<F>, R: RngCore>(
         srs: &UniversalSRS<F, PC>,
         c: C,
         num_output_variables: usize,
+        rng: &mut R,
     ) -> Result<(IndexProverKey<F, PC>, IndexVerifierKey<F, PC>), Error<PC::Error>> {
         let index_time = start_timer!(|| "Marlin::Index");
 
         // TODO: Add check that c is in the correct mode.
-        let index = AHPForR1CS::index(c, num_output_variables)?;
+        let index = AHPForR1CS::index(c, num_output_variables, rng)?;
         if srs.max_degree() < index.max_degree() {
             Err(Error::IndexTooLarge)?;
         }

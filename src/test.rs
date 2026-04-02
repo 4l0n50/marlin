@@ -113,6 +113,85 @@ impl<F: Field> ConstraintSynthesizer<F> for OutlineTestCircuit<F> {
     }
 }
 
+/// Fibonacci circuit: given public inputs f_0, f_1, proves knowledge of a Fibonacci
+/// chain of `num_steps` steps, with the last two values as public outputs.
+///
+/// H layout: x = (1, f_0, f_1), w_internal = (f_2, ..., f_{n-1}), y = (f_n, f_{n+1}).
+/// The circuit adds enough dummy constraints so that num_constraints >= num_variables
+/// **before** squaring, ensuring the squaring step adds dummy *constraints* (not witnesses)
+/// and the output variables remain last in the witness assignment.
+#[derive(Clone)]
+struct FibonacciCircuit<F: Field> {
+    /// The starting values (None in setup mode).
+    f0: Option<F>,
+    f1: Option<F>,
+    /// Number of Fibonacci steps (chain has num_steps+2 values: f_0..f_{num_steps+1}).
+    num_steps: usize,
+}
+
+impl<F: Field> ConstraintSynthesizer<F> for FibonacciCircuit<F> {
+    fn generate_constraints(self, cs: ConstraintSystemRef<F>) -> Result<(), SynthesisError> {
+        let n = self.num_steps;
+        assert!(n >= 2, "need at least 2 steps so there are 2 output values");
+
+        // Compute the full Fibonacci chain if values are provided.
+        let chain: Option<Vec<F>> = self.f0.zip(self.f1).map(|(f0, f1)| {
+            let mut v = vec![f0, f1];
+            for i in 2..(n + 2) {
+                v.push(v[i - 1] + v[i - 2]);
+            }
+            v
+        });
+
+        let val = |i: usize| -> Result<F, SynthesisError> {
+            chain.as_ref().map(|v| v[i]).ok_or(SynthesisError::AssignmentMissing)
+        };
+
+        // Public inputs: f_0, f_1  (after the leading 1 added by formatting)
+        let vars_x: Vec<_> = (0..2)
+            .map(|i| cs.new_input_variable(|| val(i)))
+            .collect::<Result<_, _>>()?;
+
+        // Internal witnesses: f_2 ... f_{n-1}
+        let mut vars_w: Vec<_> = (2..n)
+            .map(|i| cs.new_witness_variable(|| val(i)))
+            .collect::<Result<_, _>>()?;
+
+        // Public outputs — declared last so they sit at the end of witness_assignment.
+        // We add dummy constraints below to ensure squaring never appends more witnesses.
+        let vars_y: Vec<_> = (n..n + 2)
+            .map(|i| cs.new_witness_variable(|| val(i)))
+            .collect::<Result<_, _>>()?;
+
+        // All vars in chain order for the Fibonacci constraints.
+        let mut all_vars = vars_x;
+        all_vars.append(&mut vars_w);
+        all_vars.extend_from_slice(&vars_y);
+
+        // Enforce f_i + f_{i+1} = f_{i+2}  (addition as multiplication by 1)
+        for i in 0..n {
+            cs.enforce_constraint(
+                lc!() + all_vars[i].clone() + all_vars[i + 1].clone(),
+                lc!() + (F::one(), ark_relations::r1cs::Variable::One),
+                lc!() + all_vars[i + 2].clone(),
+            )?;
+        }
+
+        // Add dummy constraints (0*0=0) until num_constraints >= num_variables,
+        // so that make_matrices_square adds more constraints (not witnesses) and
+        // the output variables remain the last entries in witness_assignment.
+        let num_vars = cs.num_instance_variables() + cs.num_witness_variables();
+        let num_cons = cs.num_constraints();
+        if num_cons < num_vars {
+            for _ in 0..(num_vars - num_cons) {
+                cs.enforce_constraint(lc!(), lc!(), lc!())?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 mod marlin {
     use super::*;
     use crate::{Marlin, SimpleHashFiatShamirRng};
@@ -149,7 +228,7 @@ mod marlin {
                 num_variables,
             };
 
-            let (index_pk, index_vk) = MarlinInst::index(&universal_srs, circ.clone(), 0).unwrap();
+            let (index_pk, index_vk) = MarlinInst::index(&universal_srs, circ.clone(), 0, rng).unwrap();
             println!("Called index");
 
             let proof = MarlinInst::prove(&index_pk, circ, rng).unwrap();
@@ -203,6 +282,40 @@ mod marlin {
     }
 
     #[test]
+    fn prove_and_verify_fibonacci() {
+        let rng = &mut ark_std::test_rng();
+        // 10 steps: chain f_0..f_11, inputs f_0,f_1, outputs f_10,f_11
+        let num_steps = 10;
+
+        let universal_srs = MarlinInst::universal_setup(200, 200, 200, rng).unwrap();
+
+        let f0 = Fr::from(1u64);
+        let f1 = Fr::from(1u64);
+        let mut chain = vec![f0, f1];
+        for i in 2..(num_steps + 2) {
+            chain.push(chain[i - 1] + chain[i - 2]);
+        }
+        let public_output = vec![chain[num_steps], chain[num_steps + 1]];
+
+        let circ = FibonacciCircuit { f0: Some(f0), f1: Some(f1), num_steps };
+
+        let (index_pk, index_vk) =
+            MarlinInst::index(&universal_srs, circ.clone(), 2, rng).unwrap();
+        println!("Fibonacci: called index");
+
+        let proof = MarlinInst::prove(&index_pk, circ, rng).unwrap();
+        println!("Fibonacci: called prover");
+
+        assert!(MarlinInst::verify(&index_vk, &[f0, f1], &public_output, &proof, rng).unwrap());
+        println!("Fibonacci: verified correctly");
+
+        // Wrong output should not verify
+        let wrong_output = vec![chain[num_steps] + Fr::from(1u64), chain[num_steps + 1]];
+        assert!(!MarlinInst::verify(&index_vk, &[f0, f1], &wrong_output, &proof, rng).unwrap());
+        println!("Fibonacci: correctly rejected wrong output");
+    }
+
+    #[test]
     /// Test on a constraint system that will trigger outlining.
     fn prove_and_test_outlining() {
         let rng = &mut ark_std::test_rng();
@@ -213,7 +326,7 @@ mod marlin {
             field_phantom: PhantomData,
         };
 
-        let (index_pk, index_vk) = MarlinInst::index(&universal_srs, circ.clone(), 0).unwrap();
+        let (index_pk, index_vk) = MarlinInst::index(&universal_srs, circ.clone(), 0, rng).unwrap();
         println!("Called index");
 
         let proof = MarlinInst::prove(&index_pk, circ, rng).unwrap();

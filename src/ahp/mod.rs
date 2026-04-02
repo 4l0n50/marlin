@@ -190,22 +190,33 @@ impl<F: PrimeField> AHPForR1CS<F> {
         // v_X(β): vanishing polynomial over the public input domain X.
         let v_X_at_beta = x_domain.evaluate_vanishing_polynomial(beta);
 
-        // v_Y(β): vanishing polynomial over the last s elements of H (public output positions).
-        // s is the actual count of output variables, not rounded to a power of 2.
+        // v_Y(β): vanishing polynomial over the s output H positions, evaluated at β.
+        // Outputs are the last s witness variables, which occupy the last s positions
+        // among {k ∈ 0..n : k % ratio != 0} (the witness slots in H).
         let s = state.num_output_variables;
         let h_elems: Vec<F> = domain_h.elements().collect();
         let n = domain_h.size();
-        let v_Y_at_beta: F = h_elems[n - s..].iter().map(|&h| beta - h).product();
+        let x_domain = GeneralEvaluationDomain::new(state.num_instance_variables)
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let ratio = n / x_domain.size();
+        let witness_h_positions: Vec<usize> = (0..n).filter(|k| k % ratio != 0).collect();
+        let output_h_positions: Vec<usize> = if s > 0 {
+            witness_h_positions[witness_h_positions.len() - s..].to_vec()
+        } else {
+            vec![]
+        };
+        let output_h_roots: Vec<F> = output_h_positions.iter().map(|&k| h_elems[k]).collect();
+        let v_Y_at_beta: F = output_h_roots.iter().map(|&h| beta - h).product();
 
         let z_c = LinearCombination::new("z_c", vec![(F::one(), "z_c")]);
         let z_b_at_beta = evals.get_lc_eval(&z_b, beta)?;
         // ŷ(β): computed directly from public output values via Lagrange interpolation
-        // over the last s positions of H — no commitment needed.
-        let y_at_beta: F = h_elems[n - s..]
+        // over the s output positions of H — no commitment needed.
+        let y_at_beta: F = output_h_roots
             .iter()
             .zip(public_output)
             .map(|(&h_i, &y_i)| {
-                let lagrange_i: F = h_elems[n - s..]
+                let lagrange_i: F = output_h_roots
                     .iter()
                     .filter(|&&h_j| h_j != h_i)
                     .map(|&h_j| (beta - h_j) / (h_i - h_j))
