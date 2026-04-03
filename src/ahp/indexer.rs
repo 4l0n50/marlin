@@ -216,15 +216,12 @@ impl<F: PrimeField> AHPForR1CS<F> {
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
         let domain_k = GeneralEvaluationDomain::new(num_non_zero)
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
-        let x_domain = GeneralEvaluationDomain::new(num_formatted_input_variables)
-            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
-
         let joint_arithmetization_time = start_timer!(|| "Arithmetizing all matrices");
         let rnd = IndexerRandomness {
-            r_row:     F::rand(rng),
-            r_col:     F::rand(rng),
-            r_val_a:   F::rand(rng),
-            r_val_b:   F::rand(rng),
+            r_row: F::rand(rng),
+            r_col: F::rand(rng),
+            r_val_a: F::rand(rng),
+            r_val_b: F::rand(rng),
             r_row_col: F::rand(rng),
         };
         let joint_arith = arithmetize_matrix(
@@ -233,7 +230,6 @@ impl<F: PrimeField> AHPForR1CS<F> {
             &b,
             domain_k,
             domain_h,
-            x_domain,
             &rnd,
         );
         end_timer!(joint_arithmetization_time);
