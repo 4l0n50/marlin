@@ -15,13 +15,31 @@ pub struct VerifierState<F: PrimeField> {
 
     pub(crate) first_round_msg: Option<VerifierFirstMsg<F>>,
     pub(crate) second_round_msg: Option<VerifierSecondMsg<F>>,
+    pub(crate) third_round_msg: Option<VerifierThirdMsg<F>>,
 
-    pub(crate) gamma: Option<F>,
+    /// gamma_claim: the inner sum γ = Φ(α,β) sent by the prover in round 3
+    pub(crate) gamma_claim: Option<F>,
+
+    /// Number of public output variables (last s witness variables by convention).
+    pub(crate) num_output_variables: usize,
+    /// Total number of variables (= num_constraints after squaring).
+    pub(crate) num_variables: usize,
+    /// Number of formatted public input variables (size of domain X).
+    pub(crate) num_instance_variables: usize,
+}
+
+/// Third verifier message.
+#[derive(Copy, Clone)]
+pub struct VerifierThirdMsg<F> {
+    /// Query point for the inner sumcheck polynomials.
+    pub zeta: F,
 }
 
 /// First message of the verifier.
 #[derive(Copy, Clone)]
 pub struct VerifierFirstMsg<F> {
+    /// Randomizer for the t(X) - Φ(α,X) zero-check.
+    pub eta: F,
     /// Query for the random polynomial.
     pub alpha: F,
     /// Randomizer for the lincheck for `A`.
@@ -45,6 +63,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         index_info: IndexInfo<F>,
         rng: &mut R,
     ) -> Result<(VerifierFirstMsg<F>, VerifierState<F>), Error> {
+        let num_output_variables = index_info.num_output_variables;
         if index_info.num_constraints != index_info.num_variables {
             return Err(Error::NonSquareMatrix);
         }
@@ -55,12 +74,14 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let domain_k = GeneralEvaluationDomain::new(index_info.num_non_zero)
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
 
+        let eta = F::rand(rng);
         let alpha = domain_h.sample_element_outside_domain(rng);
         let eta_a = F::rand(rng);
         let eta_b = F::rand(rng);
         let eta_c = F::rand(rng);
 
         let msg = VerifierFirstMsg {
+            eta,
             alpha,
             eta_a,
             eta_b,
@@ -72,7 +93,11 @@ impl<F: PrimeField> AHPForR1CS<F> {
             domain_k,
             first_round_msg: Some(msg),
             second_round_msg: None,
-            gamma: None,
+            third_round_msg: None,
+            gamma_claim: None,
+            num_output_variables,
+            num_variables: index_info.num_variables,
+            num_instance_variables: index_info.num_instance_variables,
         };
 
         Ok((msg, new_state))
@@ -91,12 +116,17 @@ impl<F: PrimeField> AHPForR1CS<F> {
     }
 
     /// Output the third message and next round state.
+    /// Absorbs the prover's gamma_claim (γ = Φ(α,β)) and samples zeta.
     pub fn verifier_third_round<R: RngCore>(
         mut state: VerifierState<F>,
+        gamma_claim: F,
         rng: &mut R,
-    ) -> VerifierState<F> {
-        state.gamma = Some(F::rand(rng));
-        state
+    ) -> (VerifierThirdMsg<F>, VerifierState<F>) {
+        state.gamma_claim = Some(gamma_claim);
+        let zeta = state.domain_k.sample_element_outside_domain(rng);
+        let msg = VerifierThirdMsg { zeta };
+        state.third_round_msg = Some(msg);
+        (msg, state)
     }
 
     /// Output the query state and next round state.
@@ -106,83 +136,46 @@ impl<F: PrimeField> AHPForR1CS<F> {
     ) -> (QuerySet<F>, VerifierState<F>) {
         let beta = state.second_round_msg.unwrap().beta;
 
-        let gamma = state.gamma.unwrap();
+        let zeta = state.third_round_msg.unwrap().zeta;
 
         let mut query_set = QuerySet::new();
-        // For the first linear combination
-        // Outer sumcheck test:
-        //   s(beta) + r(alpha, beta) * (sum_M eta_M z_M(beta)) - t(beta) * z(beta)
-        // = h_1(beta) * v_H(beta) + beta * g_1(beta)
+
+        // Outer sumcheck (evaluated at β):
         //
-        // Note that z is the interpolation of x || w, so it equals x + v_X * w
-        // We also use an optimization: instead of explicitly calculating z_c, we
-        // use the "virtual oracle" z_b * z_c
+        //   s_1(β) + r(α,β)·(η_A·z_A(β) + η_B·z_B(β)) - t(β)·ẑ(β)
+        //   - v_H(β)·h_1(β) - β·g_1(β)
+        //   + η_C·(z_A(β)·z_B(β) - z_C(β))
+        //   + η·(t(β) - γ)
+        // = 0
         //
-        // LinearCombination::new(
-        //      outer_sumcheck
-        //      vec![
-        //          (F::one(), "mask_poly".into()),
+        // where ẑ(β) = w(β)·v_X(β)·v_Y(β) + x̂(β) + ŷ(β)
+        // and γ = Φ(α,β) is the inner sum sent by the prover in round 3.
         //
-        //          (r_alpha_at_beta * (eta_a + eta_c * z_b_at_beta), "z_a".into()),
-        //          (r_alpha_at_beta * eta_b * z_b_at_beta, LCTerm::One),
-        //
-        //          (-t_at_beta * v_X_at_beta, "w".into()),
-        //          (-t_at_beta * x_at_beta, LCTerm::One),
-        //
-        //          (-v_H_at_beta, "h_1".into()),
-        //          (-beta * g_1_at_beta, LCTerm::One),
-        //      ],
-        //  )
-        //  LinearCombination::new("z_b", vec![(F::one(), z_b)])
-        //  LinearCombination::new("g_1", vec![(F::one(), g_1)], rhs::new(g_1_at_beta))
-        //  LinearCombination::new("t", vec![(F::one(), t)])
+        // Polynomials evaluated at β: g_1, z_b, z_c, y, t, outer_sumcheck.
         query_set.insert(("g_1".into(), ("beta".into(), beta)));
         query_set.insert(("z_b".into(), ("beta".into(), beta)));
+        query_set.insert(("z_c".into(), ("beta".into(), beta)));
         query_set.insert(("t".into(), ("beta".into(), beta)));
         query_set.insert(("outer_sumcheck".into(), ("beta".into(), beta)));
 
-        // For the second linear combination
-        // Inner sumcheck test:
-        //   h_2(gamma) * v_K(gamma)
-        // = a(gamma) - b(gamma) * (gamma g_2(gamma) + t(beta) / |K|)
+        // Inner sumcheck (evaluated at ζ):
+        //
+        //   a(ζ) - f(ζ)·b(ζ) - v_K(ζ)·h_2(ζ)
+        //   + ζ·(s_2(ζ)·v_H(β) + f(ζ) - ζ·g_2(ζ) - γ/|K|)
+        // = 0
         //
         // where
-        //   a(X) := sum_M (eta_M v_H(beta) v_H(alpha) val_M(X))
-        //   b(X) := (beta - row(X)) (alpha - col(X))
+        //   a(X) = v_H(α)·v_H(β)·(η_A·a_val(X) + η_B·b_val(X))
+        //   b(X) = αβ - α·row(X) - β·col(X) + row_col(X)
+        //   f(X) = the prover's witness polynomial for the sumcheck quotient
         //
-        // LinearCombination::new("g_2", vec![(F::one(), g_2)]);
+        // C is excluded from a(X) since val_C is not committed (C is a public selector matrix).
         //
-        // LinearCombination::new(
-        //     "denom".into(),
-        //     vec![
-        //         (alpha * beta, LCTerm::One),
-        //         (-alpha, "row"),
-        //         (-beta, "col"),
-        //         (F::one(), "row_col"),
-        // ]);
-        //
-        // LinearCombination::new(
-        //     "a_poly".into(),
-        //     vec![
-        //          (eta_a * "a_val".into()),
-        //          (eta_b * "b_val".into()),
-        //          (eta_c * "c_val".into()),
-        //     ],
-        // )
-        //
-        // let v_H_at_alpha = domain_h.evaluate_vanishing_polynomial(alpha);
-        // let v_H_at_beta = domain_h.evaluate_vanishing_polynomial(beta);
-        // let v_K_at_gamma = domain_k.evaluate_vanishing_polynomial(gamma);
-        //
-        // let a_poly_lc *= v_H_at_alpha * v_H_at_beta;
-        // let b_lc = denom
-        // let h_lc = LinearCombination::new("b_poly", vec![(v_K_at_gamma, "h_2")]);
-        //
-        // // This LC is the only one that is evaluated:
-        // let inner_sumcheck = a_poly_lc - (b_lc * (gamma * &g_2_at_gamma + &(t_at_beta / &k_size))) - h_lc
-        // main_lc.set_label("inner_sumcheck");
-        query_set.insert(("g_2".into(), ("gamma".into(), gamma)));
-        query_set.insert(("inner_sumcheck".into(), ("gamma".into(), gamma)));
+        // Polynomials evaluated at ζ: f, g_2, s_2, inner_sumcheck.
+        query_set.insert(("f".into(), ("zeta".into(), zeta)));
+        query_set.insert(("g_2".into(), ("zeta".into(), zeta)));
+        query_set.insert(("s_2".into(), ("zeta".into(), zeta)));
+        query_set.insert(("inner_sumcheck".into(), ("zeta".into(), zeta)));
 
         (query_set, state)
     }

@@ -16,11 +16,13 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError
 use ark_std::{
     io::{Read, Write},
     marker::PhantomData,
+    rand::RngCore,
 };
 use derivative::Derivative;
 
 use crate::ahp::constraint_systems::{
     make_matrices_square_for_indexer, num_non_zero, pad_input_for_indexer_and_prover,
+    IndexerRandomness,
 };
 
 /// Information about the index, including the field of definition, the number of
@@ -35,8 +37,11 @@ pub struct IndexInfo<F> {
     pub num_constraints: usize,
     /// The total number of non-zero entries in the sum of all constraint matrices.
     pub num_non_zero: usize,
-    /// The number of input elements.
+    /// The number of input elements (including the leading 1).
     pub num_instance_variables: usize,
+    /// The number of public output elements (last `s` witness variables by convention).
+    /// H layout is (x, w_internal, y): x first, y last, w_internal in the middle.
+    pub num_output_variables: usize,
 
     #[doc(hidden)]
     f: PhantomData<F>,
@@ -49,12 +54,14 @@ impl<F> IndexInfo<F> {
         num_constraints: usize,
         num_non_zero: usize,
         num_instance_variables: usize,
+        num_output_variables: usize,
     ) -> Self {
         Self {
             num_variables,
             num_constraints,
             num_non_zero,
             num_instance_variables,
+            num_output_variables,
             f: PhantomData,
         }
     }
@@ -64,7 +71,8 @@ impl<F: PrimeField> ark_ff::ToBytes for IndexInfo<F> {
     fn write<W: Write>(&self, mut w: W) -> ark_std::io::Result<()> {
         (self.num_variables as u64).write(&mut w)?;
         (self.num_constraints as u64).write(&mut w)?;
-        (self.num_non_zero as u64).write(&mut w)
+        (self.num_non_zero as u64).write(&mut w)?;
+        (self.num_output_variables as u64).write(&mut w)
     }
 }
 
@@ -83,17 +91,14 @@ pub type Matrix<F> = Vec<Vec<(F, usize)>>;
 pub(crate) fn sum_matrices<F: PrimeField>(
     a: &Matrix<F>,
     b: &Matrix<F>,
-    c: &Matrix<F>,
 ) -> Vec<Vec<usize>> {
     a.iter()
         .zip(b)
-        .zip(c)
-        .map(|((row_a, row_b), row_c)| {
+        .map(|(row_a, row_b)| {
             row_a
                 .iter()
                 .map(|(_, i)| *i)
                 .chain(row_b.iter().map(|(_, i)| *i))
-                .chain(row_c.iter().map(|(_, i)| *i))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect()
@@ -139,7 +144,6 @@ impl<F: PrimeField> Index<F> {
             &self.joint_arith.col,
             &self.joint_arith.val_a,
             &self.joint_arith.val_b,
-            &self.joint_arith.val_c,
             &self.joint_arith.row_col,
         ]
         .into_iter()
@@ -148,7 +152,13 @@ impl<F: PrimeField> Index<F> {
 
 impl<F: PrimeField> AHPForR1CS<F> {
     /// Generate the index for this constraint system.
-    pub fn index<C: ConstraintSynthesizer<F>>(c: C) -> Result<Index<F>, Error> {
+    /// `num_output_variables` is the number of public outputs: the last `s` witness variables
+    /// by convention, occupying the last `s` positions of H.
+    pub fn index<C: ConstraintSynthesizer<F>, R: RngCore>(
+        c: C,
+        num_output_variables: usize,
+        rng: &mut R,
+    ) -> Result<Index<F>, Error> {
         let index_time = start_timer!(|| "AHP::Index");
 
         let constraint_time = start_timer!(|| "Generating constraints");
@@ -165,9 +175,9 @@ impl<F: PrimeField> AHPForR1CS<F> {
         ics.finalize();
         make_matrices_square_for_indexer(ics.clone());
         let matrices = ics.to_matrices().expect("should not be `None`");
-        let joint_matrix = sum_matrices(&matrices.a, &matrices.b, &matrices.c);
+        let joint_matrix = sum_matrices(&matrices.a, &matrices.b);
         let num_non_zero_val = num_non_zero(&joint_matrix);
-        let (mut a, mut b, mut c) = (matrices.a, matrices.b, matrices.c);
+        let (a, b, c) = (matrices.a, matrices.b, matrices.c);
         end_timer!(matrix_processing_time);
 
         let (num_formatted_input_variables, num_witness_variables, num_constraints, num_non_zero) = (
@@ -198,7 +208,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
             num_constraints,
             num_non_zero,
             num_instance_variables: num_formatted_input_variables,
-
+            num_output_variables,
             f: PhantomData,
         };
 
@@ -206,18 +216,21 @@ impl<F: PrimeField> AHPForR1CS<F> {
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
         let domain_k = GeneralEvaluationDomain::new(num_non_zero)
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
-        let x_domain = GeneralEvaluationDomain::new(num_formatted_input_variables)
-            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
-
         let joint_arithmetization_time = start_timer!(|| "Arithmetizing all matrices");
+        let rnd = IndexerRandomness {
+            r_row: F::rand(rng),
+            r_col: F::rand(rng),
+            r_val_a: F::rand(rng),
+            r_val_b: F::rand(rng),
+            r_row_col: F::rand(rng),
+        };
         let joint_arith = arithmetize_matrix(
             &joint_matrix,
-            &mut a,
-            &mut b,
-            &mut c,
+            &a,
+            &b,
             domain_k,
             domain_h,
-            x_domain,
+            &rnd,
         );
         end_timer!(joint_arithmetization_time);
 

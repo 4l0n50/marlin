@@ -4,7 +4,10 @@ use crate::ahp::indexer::Matrix;
 use crate::ahp::*;
 use crate::BTreeMap;
 use ark_ff::{Field, PrimeField};
-use ark_poly::{EvaluationDomain, Evaluations as EvaluationsOnDomain, GeneralEvaluationDomain};
+use ark_poly::{
+    univariate::DensePolynomial, EvaluationDomain, Evaluations as EvaluationsOnDomain,
+    GeneralEvaluationDomain, UVPolynomial,
+};
 use ark_relations::{lc, r1cs::ConstraintSystemRef};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
 use ark_std::{
@@ -95,8 +98,6 @@ pub struct MatrixEvals<F: PrimeField> {
     pub val_a: EvaluationsOnDomain<F>,
     /// Evaluations of the `val_b` polynomial.
     pub val_b: EvaluationsOnDomain<F>,
-    /// Evaluations of the `val_c` polynomial.
-    pub val_c: EvaluationsOnDomain<F>,
 }
 
 /// Contains information about the arithmetization of the matrix M^*.
@@ -112,8 +113,6 @@ pub struct MatrixArithmetization<F: PrimeField> {
     pub val_a: LabeledPolynomial<F>,
     /// LDE of the non-zero entries of B^*.
     pub val_b: LabeledPolynomial<F>,
-    /// LDE of the non-zero entries of C^*.
-    pub val_c: LabeledPolynomial<F>,
     /// LDE of the vector containing entry-wise products of `row` and `col`,
     /// where `row` and `col` are as above.
     pub row_col: LabeledPolynomial<F>,
@@ -122,14 +121,60 @@ pub struct MatrixArithmetization<F: PrimeField> {
     pub evals_on_K: MatrixEvals<F>,
 }
 
+impl<F: PrimeField> MatrixArithmetization<F> {
+    /// Recover the integer `(row_indices, col_indices)` in K-domain order
+    /// (all `m = |K|` positions, including padding entries).
+    ///
+    /// `row(κ^i) = ω^{col_i of M}` and `col(κ^i) = ω^{row_i of M}` (Marlin stores
+    /// the transpose of M*, so "row" encodes column indices of M and vice versa).
+    /// Returns `(row_of_M, col_of_M)`.  Padding entries (where val_a = val_b = 0)
+    /// have `row = col = 0` and must be filtered by the caller if needed.
+    pub fn row_col_indices(
+        &self,
+        domain_h: GeneralEvaluationDomain<F>,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let h_elems: BTreeMap<_, _> = domain_h
+            .elements()
+            .enumerate()
+            .map(|(j, e)| (e, j))
+            .collect();
+        // evals_on_K.row[i] = ω^{col_of_M[i]}, evals_on_K.col[i] = ω^{row_of_M[i]}
+        let col_indices: Vec<usize> = self
+            .evals_on_K
+            .row
+            .evals
+            .iter()
+            .map(|e| *h_elems.get(e).expect("row eval not in H"))
+            .collect();
+        let row_indices: Vec<usize> = self
+            .evals_on_K
+            .col
+            .evals
+            .iter()
+            .map(|e| *h_elems.get(e).expect("col eval not in H"))
+            .collect();
+        (row_indices, col_indices)
+    }
+}
+
+/// Randomness for blinding the index polynomials.
+/// Each field element blinds one polynomial by adding `r · z_K(X)`.
+/// Order: (r_row, r_col, r_val_a, r_val_b, r_row_col).
+pub(crate) struct IndexerRandomness<F: PrimeField> {
+    pub r_row: F,
+    pub r_col: F,
+    pub r_val_a: F,
+    pub r_val_b: F,
+    pub r_row_col: F,
+}
+
 pub(crate) fn arithmetize_matrix<F: PrimeField>(
     joint_matrix: &Vec<Vec<usize>>,
     a: &Matrix<F>,
     b: &Matrix<F>,
-    c: &Matrix<F>,
     interpolation_domain: GeneralEvaluationDomain<F>,
     output_domain: GeneralEvaluationDomain<F>,
-    input_domain: GeneralEvaluationDomain<F>,
+    rnd: &IndexerRandomness<F>,
 ) -> MatrixArithmetization<F> {
     let matrix_time = start_timer!(|| "Computing row, col, and val LDEs");
 
@@ -152,13 +197,6 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
         .flatten()
         .collect::<BTreeMap<(usize, usize), F>>();
 
-    let c = c
-        .iter()
-        .enumerate()
-        .map(|(r, row)| row.iter().map(move |(f, i)| ((r, *i), *f)))
-        .flatten()
-        .collect::<BTreeMap<(usize, usize), F>>();
-
     let eq_poly_vals_time = start_timer!(|| "Precomputing eq_poly_vals");
     let eq_poly_vals: BTreeMap<F, F> = output_domain
         .elements()
@@ -170,14 +208,13 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
     let mut col_vec = Vec::with_capacity(interpolation_domain.size());
     let mut val_a_vec = Vec::with_capacity(interpolation_domain.size());
     let mut val_b_vec = Vec::with_capacity(interpolation_domain.size());
-    let mut val_c_vec = Vec::with_capacity(interpolation_domain.size());
     let mut inverses = Vec::with_capacity(interpolation_domain.size());
     let mut count = 0;
 
     for (r, row) in joint_matrix.into_iter().enumerate() {
         for i in row {
             let row_val = elems[r];
-            let col_val = elems[output_domain.reindex_by_subdomain(input_domain, *i)];
+            let col_val = elems[*i];
 
             // We are dealing with the transpose of M
             row_vec.push(col_val);
@@ -185,7 +222,6 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
             // We insert zeros if a matrix doesn't contain an entry at the given (row, col) location.
             val_a_vec.push(a.get(&(r, *i)).copied().unwrap_or(F::zero()));
             val_b_vec.push(b.get(&(r, *i)).copied().unwrap_or(F::zero()));
-            val_c_vec.push(c.get(&(r, *i)).copied().unwrap_or(F::zero()));
             inverses.push(eq_poly_vals[&col_val]);
 
             count += 1;
@@ -196,21 +232,21 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
 
     cfg_iter_mut!(val_a_vec)
         .zip(&mut val_b_vec)
-        .zip(&mut val_c_vec)
         .zip(inverses)
-        .for_each(|(((v_a, v_b), v_c), inv)| {
+        .for_each(|((v_a, v_b), inv)| {
             *v_a *= &inv;
             *v_b *= &inv;
-            *v_c *= &inv;
         });
     end_timer!(lde_evals_time);
 
+    let pad_col = *col_vec.last().expect("matrix must contain at least one entry");
+    let pad_row = *row_vec.last().expect("matrix must contain at least one entry");
+
     for _ in count..interpolation_domain.size() {
-        col_vec.push(elems[0]);
-        row_vec.push(elems[0]);
+        col_vec.push(pad_col);
+        row_vec.push(pad_row);
         val_a_vec.push(F::zero());
         val_b_vec.push(F::zero());
-        val_c_vec.push(F::zero());
     }
 
     let row_col_vec: Vec<_> = row_vec
@@ -226,8 +262,6 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
         EvaluationsOnDomain::from_vec_and_domain(val_a_vec, interpolation_domain);
     let val_b_evals_on_K =
         EvaluationsOnDomain::from_vec_and_domain(val_b_vec, interpolation_domain);
-    let val_c_evals_on_K =
-        EvaluationsOnDomain::from_vec_and_domain(val_c_vec, interpolation_domain);
     let row_col_evals_on_K =
         EvaluationsOnDomain::from_vec_and_domain(row_col_vec, interpolation_domain);
 
@@ -235,7 +269,6 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
     let col = col_evals_on_K.clone().interpolate();
     let val_a = val_a_evals_on_K.clone().interpolate();
     let val_b = val_b_evals_on_K.clone().interpolate();
-    let val_c = val_c_evals_on_K.clone().interpolate();
     let row_col = row_col_evals_on_K.clone().interpolate();
 
     end_timer!(interpolate_time);
@@ -247,15 +280,23 @@ pub(crate) fn arithmetize_matrix<F: PrimeField>(
         row_col: row_col_evals_on_K,
         val_a: val_a_evals_on_K,
         val_b: val_b_evals_on_K,
-        val_c: val_c_evals_on_K,
     };
+
+    // Blind each index polynomial with r · z_K(X), as in marlin_PHP.pdf.
+    // z_K vanishes on K, so the committed table values on K are unchanged.
+    let z_K: DensePolynomial<F> = interpolation_domain.vanishing_polynomial().into();
+    let row = row + &DensePolynomial::from_coefficients_slice(&[rnd.r_row]) * &z_K;
+    let col = col + &DensePolynomial::from_coefficients_slice(&[rnd.r_col]) * &z_K;
+    let val_a = val_a + &DensePolynomial::from_coefficients_slice(&[rnd.r_val_a]) * &z_K;
+    let val_b = val_b + &DensePolynomial::from_coefficients_slice(&[rnd.r_val_b]) * &z_K;
+    let row_col =
+        row_col + &DensePolynomial::from_coefficients_slice(&[rnd.r_row_col]) * &z_K;
 
     MatrixArithmetization {
         row: LabeledPolynomial::new("row".into(), row, None, None),
         col: LabeledPolynomial::new("col".into(), col, None, None),
         val_a: LabeledPolynomial::new("a_val".into(), val_a, None, None),
         val_b: LabeledPolynomial::new("b_val".into(), val_b, None, None),
-        val_c: LabeledPolynomial::new("c_val".into(), val_c, None, None),
         row_col: LabeledPolynomial::new("row_col".into(), row_col, None, None),
         evals_on_K,
     }
@@ -330,7 +371,7 @@ mod tests {
             vec![(F::one(), 6)],
         ];
 
-        let c = vec![
+        let _c = vec![
             vec![],
             vec![(F::one(), 7)],
             vec![],
@@ -340,42 +381,38 @@ mod tests {
             vec![],
             vec![],
         ];
-        let joint_matrix = indexer::sum_matrices(&a, &b, &c);
+        let joint_matrix = indexer::sum_matrices(&a, &b);
         let num_non_zero = dbg!(num_non_zero(&joint_matrix));
         let interpolation_domain = EvaluationDomain::new(num_non_zero).unwrap();
         let output_domain = EvaluationDomain::new(2 + 6).unwrap();
-        let input_domain = EvaluationDomain::new(2).unwrap();
+        let mut rng = ark_std::test_rng();
+        let rnd = IndexerRandomness {
+            r_row: F::rand(&mut rng),
+            r_col: F::rand(&mut rng),
+            r_val_a: F::rand(&mut rng),
+            r_val_b: F::rand(&mut rng),
+            r_row_col: F::rand(&mut rng),
+        };
         let joint_arith = arithmetize_matrix(
             &joint_matrix,
             &a,
             &b,
-            &c,
             interpolation_domain,
             output_domain,
-            input_domain,
+            &rnd,
         );
         let inverse_map = output_domain
             .elements()
             .enumerate()
             .map(|(i, e)| (e, i))
             .collect::<BTreeMap<_, _>>();
-        let elements = output_domain.elements().collect::<Vec<_>>();
-        let reindexed_inverse_map = (0..output_domain.size())
-            .map(|i| {
-                let reindexed_i = output_domain.reindex_by_subdomain(input_domain, i);
-                (elements[reindexed_i], i)
-            })
-            .collect::<BTreeMap<_, _>>();
-
         let eq_poly_vals: BTreeMap<F, F> = output_domain
             .elements()
             .zip(output_domain.batch_eval_unnormalized_bivariate_lagrange_poly_with_same_inputs())
             .collect();
 
-        let mut rng = ark_std::test_rng();
-        let eta_a = F::rand(&mut rng);
-        let eta_b = F::rand(&mut rng);
-        let eta_c = F::rand(&mut rng);
+        let eta_a = F::from(13u64);
+        let eta_b = F::from(29u64);
         for (k_index, k) in interpolation_domain.elements().enumerate() {
             let row_val = joint_arith.row.evaluate(&k);
             let col_val = joint_arith.col.evaluate(&k);
@@ -385,22 +422,17 @@ mod tests {
 
             let val_a = joint_arith.val_a.evaluate(&k);
             let val_b = joint_arith.val_b.evaluate(&k);
-            let val_c = joint_arith.val_c.evaluate(&k);
             assert_eq!(joint_arith.evals_on_K.row[k_index], row_val);
             assert_eq!(joint_arith.evals_on_K.col[k_index], col_val);
             assert_eq!(joint_arith.evals_on_K.val_a[k_index], val_a);
             assert_eq!(joint_arith.evals_on_K.val_b[k_index], val_b);
-            assert_eq!(joint_arith.evals_on_K.val_c[k_index], val_c);
             if k_index < num_non_zero {
-                let col = *dbg!(reindexed_inverse_map.get(&row_val).unwrap());
+                let col = *dbg!(inverse_map.get(&row_val).unwrap());
                 let row = *dbg!(inverse_map.get(&col_val).unwrap());
                 assert!(joint_matrix[row].binary_search(&col).is_ok());
                 assert_eq!(
-                    eta_a * val_a + eta_b * val_b + eta_c * val_c,
-                    inverse
-                        * (eta_a * entry(&a, row, col)
-                            + eta_b * entry(&b, row, col)
-                            + eta_c * entry(&c, row, col)),
+                    eta_a * val_a + eta_b * val_b,
+                    inverse * (eta_a * entry(&a, row, col) + eta_b * entry(&b, row, col)),
                 );
             }
         }
