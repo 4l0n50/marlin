@@ -45,10 +45,11 @@ impl<F: PrimeField> ConstraintSynthesizer<F> for DummyCircuit<F> {
     fn generate_constraints(self, cs: ConstraintSystemRef<F>) -> Result<(), SynthesisError> {
         let a = cs.new_witness_variable(|| self.a.ok_or(SynthesisError::AssignmentMissing))?;
         let b = cs.new_witness_variable(|| self.b.ok_or(SynthesisError::AssignmentMissing))?;
-        let c = cs.new_input_variable(|| {
+
+        // output variable: a * b (last witness variable, as modified Marlin expects)
+        let c = cs.new_witness_variable(|| {
             let a = self.a.ok_or(SynthesisError::AssignmentMissing)?;
             let b = self.b.ok_or(SynthesisError::AssignmentMissing)?;
-
             Ok(a * b)
         })?;
 
@@ -86,7 +87,7 @@ macro_rules! marlin_prove_bench {
             $bench_field,
             SonicKZG10<$bench_pairing_engine, DensePolynomial<$bench_field>>,
             SimpleHashFiatShamirRng<Blake2s, ChaChaRng>,
-        >::index(&srs, c)
+        >::index(&srs, c, 1, rng)
         .unwrap();
 
         let start = ark_std::time::Instant::now();
@@ -128,7 +129,7 @@ macro_rules! marlin_verify_bench {
             $bench_field,
             SonicKZG10<$bench_pairing_engine, DensePolynomial<$bench_field>>,
             SimpleHashFiatShamirRng<Blake2s, ChaChaRng>,
-        >::index(&srs, c)
+        >::index(&srs, c, 1, rng)
         .unwrap();
         let proof = Marlin::<
             $bench_field,
@@ -146,7 +147,7 @@ macro_rules! marlin_verify_bench {
                 $bench_field,
                 SonicKZG10<$bench_pairing_engine, DensePolynomial<$bench_field>>,
                 SimpleHashFiatShamirRng<Blake2s, ChaChaRng>,
-            >::verify(&vk, &vec![v], &proof, rng)
+            >::verify(&vk, &[], &[v], &proof, rng)
             .unwrap();
         }
 
